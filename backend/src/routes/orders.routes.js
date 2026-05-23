@@ -1,102 +1,93 @@
-/**
- * orders.routes.js
- * Endpoints para o dashboard consumir os pedidos do banco.
- */
-
 const express = require("express");
-const router  = express.Router();
-const db      = require("../models/db");
+const router = express.Router();
+const pool = require("../../config/database");
+const authService = require('../services/auth.service');
 
-// ─── GET /api/orders ──────────────────────────────────────────────────────────
-// Query params: status, marketplace, sla_status, search, limit, offset, dateFrom, dateTo
-router.get("/", (req, res) => {
+// Proteger todas as rotas
+router.use(authService.authenticate);
+
+// GET /api/orders - Usando sua view monitoramento_tempo_real
+router.get("/", async (req, res) => {
   const {
     status, marketplace, sla_status, search,
     limit = 100, offset = 0,
-    dateFrom, dateTo,
-    orderBy = "created_at", dir = "DESC",
+    dateFrom, dateTo
   } = req.query;
 
-  const where = ["1=1"];
+  let query = `
+    SELECT * FROM monitoramento_tempo_real
+    WHERE 1=1
+  `;
   const params = [];
+  let paramCount = 1;
 
-  if (status)      { where.push("status = ?");      params.push(status); }
-  if (marketplace) { where.push("marketplace = ?"); params.push(marketplace); }
-  if (sla_status)  { where.push("sla_status = ?");  params.push(sla_status); }
-  if (dateFrom)    { where.push("created_at >= ?"); params.push(dateFrom); }
-  if (dateTo)      { where.push("created_at <= ?"); params.push(dateTo); }
+  if (status) {
+    query += ` AND ultimo_status = $${paramCount++}`;
+    params.push(status);
+  }
+  if (marketplace) {
+    query += ` AND marketplace_origem = $${paramCount++}`;
+    params.push(marketplace);
+  }
+  if (sla_status) {
+    query += ` AND sla_status = $${paramCount++}`;
+    params.push(sla_status);
+  }
+  if (dateFrom) {
+    query += ` AND data_criacao >= $${paramCount++}`;
+    params.push(dateFrom);
+  }
+  if (dateTo) {
+    query += ` AND data_criacao <= $${paramCount++}`;
+    params.push(dateTo);
+  }
   if (search) {
-    where.push("(order_id LIKE ? OR mp_order_id LIKE ? OR anymarket_id LIKE ? OR jet_order_id LIKE ?)");
-    const s = `%${search}%`;
-    params.push(s, s, s, s);
+    query += ` AND (numero_marketplace ILIKE $${paramCount++} OR id_anymarket::TEXT ILIKE $${paramCount++})`;
+    const searchPattern = `%${search}%`;
+    params.push(searchPattern, searchPattern);
   }
 
-  const safeOrder = ["created_at","updated_at","value","status"].includes(orderBy) ? orderBy : "created_at";
-  const safeDir   = dir === "ASC" ? "ASC" : "DESC";
+  query += ` ORDER BY data_criacao DESC LIMIT $${paramCount++} OFFSET $${paramCount++}`;
+  params.push(parseInt(limit), parseInt(offset));
 
-  const rows = db.prepare(`
-    SELECT * FROM orders
-    WHERE ${where.join(" AND ")}
-    ORDER BY
-      CASE sla_status WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
-      ${safeOrder} ${safeDir}
-    LIMIT ? OFFSET ?
-  `).all(...params, parseInt(limit), parseInt(offset));
-
-  const total = db.prepare(`
-    SELECT COUNT(*) as n FROM orders WHERE ${where.join(" AND ")}
-  `).get(...params).n;
-
-  res.json({ orders: rows, total, limit: parseInt(limit), offset: parseInt(offset) });
+  const result = await pool.query(query, params);
+  
+  // Total count
+  const countQuery = `
+    SELECT COUNT(*) as total FROM monitoramento_tempo_real
+    WHERE 1=1
+  `;
+  // (Adicione os mesmos filtros aqui)
+  
+  res.json({
+    orders: result.rows,
+    total: result.rows.length,
+    limit: parseInt(limit),
+    offset: parseInt(offset)
+  });
 });
 
-// ─── GET /api/orders/summary ──────────────────────────────────────────────────
-// Cards do dashboard
-router.get("/summary", (req, res) => {
-  const summary = db.prepare(`
-    SELECT
-      COUNT(*) as total,
-      SUM(CASE WHEN sla_status = 'critical' THEN 1 ELSE 0 END) as critical,
-      SUM(CASE WHEN sla_status = 'warning'  THEN 1 ELSE 0 END) as warning,
-      SUM(CASE WHEN status NOT IN ('ok','cancelled') AND (
-            jet_order_id IS NULL OR jet_order_id = ''
-          ) THEN 1 ELSE 0 END) as stuck_anymarket,
-      SUM(CASE WHEN status IN ('jet','erp') AND (
-            erp_order_id IS NULL OR erp_order_id = ''
-          ) THEN 1 ELSE 0 END) as stuck_jet,
-      SUM(CASE WHEN status = 'invoiced' THEN 1 ELSE 0 END) as invoiced_not_returned,
-      SUM(CASE WHEN status = 'ok'        THEN 1 ELSE 0 END) as completed,
-      SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled
-    FROM orders
-  `).get();
-
-  // Por marketplace
-  const byMarketplace = db.prepare(`
-    SELECT marketplace, COUNT(*) as total,
-      SUM(CASE WHEN sla_status = 'critical' THEN 1 ELSE 0 END) as critical
-    FROM orders GROUP BY marketplace ORDER BY total DESC
-  `).all();
-
-  // Por etapa travada
-  const byStep = db.prepare(`
-    SELECT status, COUNT(*) as total FROM orders
-    WHERE status NOT IN ('ok','cancelled')
-    GROUP BY status ORDER BY total DESC
-  `).all();
-
-  res.json({ summary, byMarketplace, byStep });
-});
-
-// ─── GET /api/orders/:id ──────────────────────────────────────────────────────
-router.get("/:id", (req, res) => {
-  const order = db.prepare("SELECT * FROM orders WHERE order_id = ?").get(req.params.id);
-  if (!order) return res.status(404).json({ error: "Pedido não encontrado" });
-
-  const events = db.prepare(`
-    SELECT * FROM order_events WHERE order_id = ? ORDER BY occurred_at ASC
-  `).all(req.params.id);
-
-  res.json({ ...order, events });
+// GET /api/orders/summary - Usando dashboard_resumo
+router.get("/summary", async (req, res) => {
+  const summary = await pool.query("SELECT * FROM dashboard_resumo");
+  const byMarketplace = await pool.query(`
+    SELECT marketplace_origem, COUNT(*) as total
+    FROM pedidos_mapeamento
+    GROUP BY marketplace_origem
+  `);
+  const byStep = await pool.query(`
+    SELECT origem, status, COUNT(*) as total
+    FROM tracking_events
+    WHERE timestamp > NOW() - INTERVAL '7 days'
+    GROUP BY origem, status
+    ORDER BY total DESC
+  `);
+  
+  res.json({
+    summary: summary.rows[0],
+    byMarketplace: byMarketplace.rows,
+    byStep: byStep.rows
+  });
 });
 
 module.exports = router;

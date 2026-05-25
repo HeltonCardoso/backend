@@ -200,6 +200,17 @@ function extractMercadoLivre(row) {
     const firstVal = Object.values(row)[0]?.toString().trim();
     if (firstVal && firstVal.length >= 10 && !isNaN(firstVal)) pedidoId = firstVal;
   }
+
+  // ML tem dois identificadores:
+  //   marketplace_number : "2000013087177419"  ← número do PEDIDO  (vem na planilha exportada do ML)
+  //   numero_marketplace : "S-47112367749"     ← número do CARRINHO (salvo no banco via Anymarket)
+  //
+  // Regras:
+  //  • Planilha com 2000... → busca no banco pelo campo marketplace_number dentro de dados_completos
+  //  • Planilha com S-...   → busca direta no pedido_id  OU  numero_marketplace em dados_completos
+  const isTipoPedido   = pedidoId && /^\d{14,}$/.test(pedidoId);  // 2000... (numérico, 14+ dígitos)
+  const isTipoCarrinho = pedidoId && /^S-/i.test(pedidoId);        // S-...
+
   return {
     pedido_id_original: pedidoId,
     pedido_id_normalizado: pedidoId ? normalizeOrderId(pedidoId) : null,
@@ -207,7 +218,10 @@ function extractMercadoLivre(row) {
     status,
     valor_total: valor,
     cliente: (cliente || 'N/A').substring(0, 100),
-    data
+    data,
+    // ids_alternativos será usado na busca no banco para ML
+    ids_alternativos: pedidoId ? [pedidoId] : [],
+    _ml_tipo: isTipoPedido ? 'numero_pedido' : isTipoCarrinho ? 'numero_carrinho' : 'desconhecido',
   };
 }
 
@@ -318,13 +332,71 @@ router.post('/compare', authService.authenticate, upload.single('planilha'), asy
       ...[1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => `${p.pedido_id_original}-${n}`)
     ].filter(Boolean)))];
 
+    // Busca padrão: pelo pedido_id salvo no tracking_events
     const result = await pool.query(
       `SELECT DISTINCT pedido_id FROM tracking_events WHERE pedido_id = ANY($1::text[])`,
       [possiveisIds]
     );
     const integradosSet = new Set(result.rows.map(r => r.pedido_id));
 
+    // ── Busca extra para Mercado Livre ────────────────────────────────────────
+    // O ML usa dois identificadores distintos:
+    //   • marketPlaceNumber / marketplace_number / packId  → "2000012986617205"  (vem na planilha exportada)
+    //   • marketPlaceId    / numero_marketplace / pedido_id → "S-47067376563"   (salvo no banco)
+    //
+    // Um pedido pode ter os dados em `payload`, em `dados_completos`, ou em ambos.
+    // A query abaixo cobre todas as combinações em uma única passagem.
+    let mlIntegradosPorMarketplaceNumber = new Set();
+    if (tipoPlanilha === 'MERCADO_LIVRE') {
+      const idsMl = pedidosValidos.map(p => p.pedido_id_original).filter(Boolean);
+      if (idsMl.length) {
+        const mlResult = await pool.query(
+          `SELECT DISTINCT
+             pedido_id,
+             -- Extrai o número que veio da planilha (2000...) de qualquer coluna
+             COALESCE(
+               -- 1. payload (Anymarket) - campos camelCase
+               payload->>'marketPlaceNumber',
+               payload->'metadata'->>'packId',
+               payload->>'marketPlaceId',
+               -- 2. dados_completos - campos snake_case
+               dados_completos->>'marketplace_number',
+               dados_completos->>'numero_marketplace',
+               dados_completos->>'marketplaceNumber'
+             ) AS id_externo
+           FROM tracking_events
+           WHERE origem = 'ANYMARKET'
+             AND (
+               -- ── Busca em payload (estrutura Anymarket camelCase) ──────────
+               payload->>'marketPlaceNumber'      = ANY($1::text[])
+               OR payload->'metadata'->>'packId'  = ANY($1::text[])
+               -- marketPlaceId pode ser S-... então também testamos
+               OR payload->>'marketPlaceId'       = ANY($1::text[])
+
+               -- ── Busca em dados_completos (snake_case / variações) ─────────
+               OR dados_completos->>'marketplace_number'   = ANY($1::text[])
+               OR dados_completos->>'numero_marketplace'   = ANY($1::text[])
+               OR dados_completos->>'marketplaceNumber'    = ANY($1::text[])
+             )`,
+          [idsMl]
+        );
+
+        for (const row of mlResult.rows) {
+          // Registra o id externo (2000... ou S-...) como integrado
+          if (row.id_externo) mlIntegradosPorMarketplaceNumber.add(row.id_externo);
+          // Registra o pedido_id real do banco (S-...) para reuso no filtro
+          if (row.pedido_id)  integradosSet.add(row.pedido_id);
+        }
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     const naoIntegrados = pedidosValidos.filter(p => {
+      // Para ML, verifica também pelo marketplace_number nos dados_completos
+      if (tipoPlanilha === 'MERCADO_LIVRE' && p.pedido_id_original) {
+        if (mlIntegradosPorMarketplaceNumber.has(p.pedido_id_original)) return false;
+      }
+
       const variantes = [
         p.pedido_id_original,
         p.pedido_id_normalizado,

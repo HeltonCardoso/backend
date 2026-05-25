@@ -8,7 +8,6 @@ const JWT_EXPIRES_IN = '24h';
 
 function verifyPbkdf2Password(password, hashedPassword) {
     try {
-        // Formato: pbkdf2:sha256:1000000$BLPnhW7QDXlivESX$ab48abd8c2c1b09df2b9b43efc7ec24f049bac1bee19bca4c640aa0fa363b85d
         const parts = hashedPassword.split('$');
         
         if (parts.length < 3) {
@@ -98,7 +97,8 @@ class AuthService {
         }
     }
 
-    authenticate(req, res, next) {
+    // Arrow function para preservar o contexto 'this'
+    authenticate = (req, res, next) => {
         const authHeader = req.headers.authorization;
         
         if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -114,7 +114,7 @@ class AuthService {
 
         req.user = result.decoded;
         next();
-    }
+    };
 }
 
 module.exports = new AuthService();

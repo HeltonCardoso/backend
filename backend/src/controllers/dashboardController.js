@@ -63,10 +63,15 @@ const DashboardController = {
 
       const travadosResult = await pool.query(`
         WITH ultimo_evento AS (
-          SELECT DISTINCT ON (pedido_id)
-            pedido_id, origem, status, timestamp
-          FROM tracking_events
-          ORDER BY pedido_id, timestamp DESC
+          SELECT DISTINCT ON (te.pedido_id)
+            te.pedido_id, 
+            te.origem, 
+            te.status, 
+            te.timestamp,
+            pm.prazo_despacho
+          FROM tracking_events te
+          LEFT JOIN pedidos_mapeamento pm ON te.pedido_id = pm.numero_marketplace
+          ORDER BY te.pedido_id, te.timestamp DESC
         ),
         pedidos_finalizados AS (
           SELECT pedido_id FROM tracking_events
@@ -79,11 +84,17 @@ const DashboardController = {
         )
         SELECT COUNT(*) as total
         FROM ultimo_evento u
-        WHERE u.timestamp < NOW() - INTERVAL '1 hour'
-          AND u.pedido_id NOT IN (SELECT pedido_id FROM pedidos_finalizados)
+        WHERE u.pedido_id NOT IN (SELECT pedido_id FROM pedidos_finalizados)
           AND u.pedido_id NOT IN (SELECT pedido_id FROM pedidos_completos)
           AND u.origem NOT IN ('RETORNO_ANYMARKET','RETORNO_MARKETPLACE')
           AND u.status NOT IN ('ENTREGUE', 'CANCELADO', 'CONCLUDED', 'CANCELED')
+          AND (
+            -- Caso 1: Tem prazo e passou do prazo
+            (u.prazo_despacho IS NOT NULL AND NOW() > u.prazo_despacho)
+            OR
+            -- Caso 2: Não tem prazo e está parado há mais de 1 hora
+            (u.prazo_despacho IS NULL AND u.timestamp < NOW() - INTERVAL '1 hour')
+          )
       `);
       const pedidosTravados = parseInt(travadosResult.rows[0].total);
 

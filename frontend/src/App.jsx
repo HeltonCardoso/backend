@@ -2,6 +2,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import './App.css';
 import Login from './components/Login';
+import UploadPlanilha from './components/UploadPlanilha';
 
 const AUTO_REFRESH_SECONDS = 60;
 
@@ -218,6 +219,7 @@ function App() {
     { id: 'pipeline', icon: '⇉', label: 'Pipeline' },
     { id: 'anomalias', icon: '⚠', label: 'Anomalias', badge: dashboardData.anomaliasNaoResolvidas },
     { id: 'graficos', icon: '▦', label: 'Gráficos' },
+    { id: 'upload', icon: '📤', label: 'Upload Planilha' }, 
   ];
 
   const maxVolume = Math.max(...(graficos.volumeHoras?.map(h => h.total) || [1]), 1);
@@ -241,8 +243,8 @@ function App() {
         </button>
 
         <div className="sidebar-logo">
-          <span className="logo-icon">◈</span>
-          <span className="logo-text">Monitor<strong>360</strong></span>
+          <div className="logo-icon">M</div>
+          <span className="logo-text">Monitor<span>360</span></span>
         </div>
 
         <nav className="sidebar-nav">
@@ -261,14 +263,14 @@ function App() {
         </nav>
 
         <div className="sidebar-footer">
-          <div className="pipeline-legend">
-            <p className="legend-title">Fluxo do Pipeline</p>
-            {['ANYMARKET', 'JET', 'ONCLICK', 'RETORNO_JET', 'RETORNO_ANYMARKET'].map((o, i, arr) => (
-              <React.Fragment key={o}>
-                <span className="legend-dot" style={{ background: getOrigemColor(o) }} title={traduzirOrigem(o)} />
-                {i < arr.length - 1 && <span className="legend-arrow">→</span>}
-              </React.Fragment>
-            ))}
+          <div className="sidebar-user">
+            <div className="user-avatar">
+              {user?.username?.charAt(0).toUpperCase() || 'U'}
+            </div>
+            <div className="user-info">
+              <div className="user-info-name">{user?.username || 'Usuário'}</div>
+              <div className="user-info-role">Administrador</div>
+            </div>
           </div>
         </div>
       </aside>
@@ -286,9 +288,10 @@ function App() {
             <button className="menu-toggle" onClick={() => setSidebarOpen(o => !o)}>
               <span /><span /><span />
             </button>
-            <div className="page-title">
-              <h1>{navItems.find(n => n.id === activeSection)?.label}</h1>
-              <p className="topbar-sub">Atualizado {formatTimeAgo(lastRefresh)}</p>
+            <div className="topbar-breadcrumb">
+              <span className="bc-home">Monitor360</span>
+              <span className="bc-sep">/</span>
+              <span className="bc-page">{navItems.find(n => n.id === activeSection)?.label}</span>
             </div>
           </div>
 
@@ -298,13 +301,8 @@ function App() {
               <span>Ao vivo</span>
             </div>
             
-            {/* Nome do usuário */}
-            <span className="user-name" style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
-              👤 {user?.username}
-            </span>
-            
             <button className="topbar-btn backfill" onClick={handleBackfill} disabled={backfillLoading}>
-              {backfillLoading ? '🔄 Importando...' : '📥 Backfill 30d'}
+              {backfillLoading ? '🔄 Importando...' : '📥 Importação pedidos 30 dias'}
             </button>
             
             <button className="topbar-btn" onClick={refreshAll}>
@@ -599,12 +597,18 @@ function App() {
             <div className="section-anomalias">
               <div className="anomalias-summary">
                 <div className="anomalia-kpi danger">
-                  <span className="ak-value">{anomalias.filter(a=>!a.resolvida).length}</span>
-                  <span className="ak-label">Não resolvidas</span>
+                  <div className="ak-icon">⚠️</div>
+                  <div>
+                    <span className="ak-value">{anomalias.filter(a=>!a.resolvida).length}</span>
+                    <div className="ak-label">Não resolvidas</div>
+                  </div>
                 </div>
                 <div className="anomalia-kpi success">
-                  <span className="ak-value">{anomalias.filter(a=>a.resolvida).length}</span>
-                  <span className="ak-label">Resolvidas</span>
+                  <div className="ak-icon">✅</div>
+                  <div>
+                    <span className="ak-value">{anomalias.filter(a=>a.resolvida).length}</span>
+                    <div className="ak-label">Resolvidas</div>
+                  </div>
                 </div>
               </div>
 
@@ -703,7 +707,11 @@ function App() {
                 </div>
               </div>
             </div>
+            
           )}
+          {activeSection === 'upload' && (
+              <UploadPlanilha />
+            )}
         </main>
       </div>
 

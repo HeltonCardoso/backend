@@ -340,12 +340,24 @@ router.post('/compare', authService.authenticate, upload.single('planilha'), asy
     const integradosSet = new Set(result.rows.map(r => r.pedido_id));
 
     // ── Busca extra para Mercado Livre ────────────────────────────────────────
-    // O ML usa dois identificadores distintos:
-    //   • marketPlaceNumber / marketplace_number / packId  → "2000012986617205"  (vem na planilha exportada)
-    //   • marketPlaceId    / numero_marketplace / pedido_id → "S-47067376563"   (salvo no banco)
+    // A planilha do ML sempre traz o número 2000... (ex: "2000013158162051").
+    // No banco o pedido é salvo com pedido_id = S-... (ex: "S-47143100695").
     //
-    // Um pedido pode ter os dados em `payload`, em `dados_completos`, ou em ambos.
-    // A query abaixo cobre todas as combinações em uma única passagem.
+    // O número 2000... pode estar em campos DIFERENTES dependendo da origem do registro:
+    //
+    //  origem ANYMARKET → dados_completos:
+    //    • "marketPlaceNumber": "2000013158162051"   ← campo principal
+    //    • "metadata" -> "packId": "2000013158162051" ← campo alternativo
+    //    • "marketPlaceId": "S-47143100695"           ← o S-...
+    //
+    //  origem JET / RETORNO_JET → dados_completos:
+    //    • "marketPlacePackId": "2000013158162051"    ← campo exclusivo do JET
+    //    • "marketPlaceNumberOrder": "S-47143100695"  ← o S-...
+    //
+    //  origem JET (json_completo_jet aninhado) → dados_completos->json_completo_jet:
+    //    • "marketPlacePackId": "2000013158162051"    ← mesmo campo, um nível abaixo
+    //
+    // NÃO filtra por origem — um mesmo pedido_id pode ter registros em origens diferentes.
     let mlIntegradosPorMarketplaceNumber = new Set();
     if (tipoPlanilha === 'MERCADO_LIVRE') {
       const idsMl = pedidosValidos.map(p => p.pedido_id_original).filter(Boolean);
@@ -353,38 +365,44 @@ router.post('/compare', authService.authenticate, upload.single('planilha'), asy
         const mlResult = await pool.query(
           `SELECT DISTINCT
              pedido_id,
-             -- Extrai o número que veio da planilha (2000...) de qualquer coluna
+             -- Retorna o número 2000... que casou, para marcar como integrado
              COALESCE(
-               -- 1. payload (Anymarket) - campos camelCase
-               payload->>'marketPlaceNumber',
-               payload->'metadata'->>'packId',
-               payload->>'marketPlaceId',
-               -- 2. dados_completos - campos snake_case
+               -- ANYMARKET: campo principal
+               dados_completos->>'marketPlaceNumber',
+               -- ANYMARKET: campo alternativo dentro de metadata
+               dados_completos->'metadata'->>'packId',
+               -- JET/RETORNO_JET: campo exclusivo do fluxo JET
+               dados_completos->>'marketPlacePackId',
+               -- JET: mesmo campo dentro do json_completo_jet aninhado
+               dados_completos->'json_completo_jet'->>'marketPlacePackId',
+               -- snake_case (registros mais antigos)
                dados_completos->>'marketplace_number',
-               dados_completos->>'numero_marketplace',
-               dados_completos->>'marketplaceNumber'
+               dados_completos->>'marketplaceNumber',
+               -- payload como fallback (alguns registros Anymarket guardam aqui)
+               payload->>'marketPlaceNumber',
+               payload->'metadata'->>'packId'
              ) AS id_externo
            FROM tracking_events
-           WHERE origem = 'ANYMARKET'
-             AND (
-               -- ── Busca em payload (estrutura Anymarket camelCase) ──────────
-               payload->>'marketPlaceNumber'      = ANY($1::text[])
-               OR payload->'metadata'->>'packId'  = ANY($1::text[])
-               -- marketPlaceId pode ser S-... então também testamos
-               OR payload->>'marketPlaceId'       = ANY($1::text[])
-
-               -- ── Busca em dados_completos (snake_case / variações) ─────────
-               OR dados_completos->>'marketplace_number'   = ANY($1::text[])
-               OR dados_completos->>'numero_marketplace'   = ANY($1::text[])
-               OR dados_completos->>'marketplaceNumber'    = ANY($1::text[])
-             )`,
+           WHERE
+             -- ── ANYMARKET: campo principal ──────────────────────────────────
+             dados_completos->>'marketPlaceNumber'                       = ANY($1::text[])
+             -- ── ANYMARKET: metadata.packId ──────────────────────────────────
+             OR dados_completos->'metadata'->>'packId'                   = ANY($1::text[])
+             -- ── JET / RETORNO_JET: marketPlacePackId ────────────────────────
+             OR dados_completos->>'marketPlacePackId'                    = ANY($1::text[])
+             -- ── JET: json_completo_jet aninhado ─────────────────────────────
+             OR dados_completos->'json_completo_jet'->>'marketPlacePackId' = ANY($1::text[])
+             -- ── snake_case legado ────────────────────────────────────────────
+             OR dados_completos->>'marketplace_number'                   = ANY($1::text[])
+             OR dados_completos->>'marketplaceNumber'                    = ANY($1::text[])
+             -- ── payload fallback ─────────────────────────────────────────────
+             OR payload->>'marketPlaceNumber'                            = ANY($1::text[])
+             OR payload->'metadata'->>'packId'                           = ANY($1::text[])`,
           [idsMl]
         );
 
         for (const row of mlResult.rows) {
-          // Registra o id externo (2000... ou S-...) como integrado
           if (row.id_externo) mlIntegradosPorMarketplaceNumber.add(row.id_externo);
-          // Registra o pedido_id real do banco (S-...) para reuso no filtro
           if (row.pedido_id)  integradosSet.add(row.pedido_id);
         }
       }

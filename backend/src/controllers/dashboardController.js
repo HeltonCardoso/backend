@@ -202,13 +202,14 @@ const DashboardController = {
 
   async getPedidosPipeline(req, res) {
     try {
-      const { page = 1, limit = 20, marketplace, travados, loja } = req.query;
+      const { page = 1, limit = 20, marketplace, travados, loja, sort, quickFilter } = req.query;
       const offset = (parseInt(page) - 1) * parseInt(limit);
 
+      // ── Filtros base: exclui pedidos finalizados ───────────────────
       let baseWhere = `WHERE te.origem IN ('ANYMARKET','JET','ONCLICK','RETORNO_JET','RETORNO_ANYMARKET')
         AND te.pedido_id NOT IN (
-          SELECT pedido_id FROM tracking_events 
-          WHERE origem = 'ANYMARKET' 
+          SELECT pedido_id FROM tracking_events
+          WHERE origem = 'ANYMARKET'
           AND status IN ('ENTREGUE', 'CANCELADO', 'CONCLUDED', 'CANCELED')
         )`;
       const params = [];
@@ -223,68 +224,115 @@ const DashboardController = {
         baseWhere += ` AND pm.loja = $${params.length}`;
       }
 
+      // ── Filtro "fora do prazo" aplicado no CTE externo ────────────
+      // Caso 1: tem prazo e já venceu
+      // Caso 2: não tem prazo e está sem update há mais de 1h
+      // (os dois são OR — qualquer um já caracteriza "fora do prazo")
       const travadosFiltro = travados === 'true'
-        ? `WHERE horas_sem_update > 1
-             AND NOT ('RETORNO_ANYMARKET' = ANY(origens))
-             AND (prazo_despacho IS NULL OR prazo_despacho < NOW())`
+        ? `AND (
+             (prazo_despacho IS NOT NULL AND prazo_despacho < NOW())
+             OR
+             (prazo_despacho IS NULL AND horas_sem_update > 1)
+           )`
         : '';
 
+      // ── Quick filters dos contadores clicáveis ─────────────────────
+      const quickFilterClause = {
+        foraPrazo: `AND (
+                      (prazo_despacho IS NOT NULL AND prazo_despacho < NOW())
+                      OR (prazo_despacho IS NULL AND horas_sem_update > 1)
+                    )`,
+        urgentes:  `AND prazo_despacho IS NOT NULL
+                    AND prazo_despacho >= NOW()
+                    AND prazo_despacho < NOW() + INTERVAL '24 hours'`,
+        semPrazo:  `AND prazo_despacho IS NULL`,
+      }[quickFilter] || '';
+
+      // ── Ordenação ─────────────────────────────────────────────────
+      // prazo_asc  → urgentes/atrasados primeiro (menor horas_ate_prazo, negativos sobem)
+      // prazo_desc → mais atrasados primeiro (idem — valor mais negativo = mais atrasado)
+      // parado_desc → parado há mais tempo primeiro
+      const orderBy = {
+        prazo_asc:   'horas_ate_prazo ASC NULLS LAST',
+        prazo_desc:  'horas_ate_prazo ASC NULLS LAST',
+        parado_desc: 'horas_sem_update DESC NULLS LAST',
+      }[sort] || 'ultimo_evento DESC NULLS LAST';
+
+      // ── Query principal com paginação ──────────────────────────────
       const pedidosQuery = `
         WITH eventos_pedido AS (
-          SELECT 
+          SELECT
             te.pedido_id,
-            ARRAY_AGG(DISTINCT te.origem) as origens,
-            MAX(te.timestamp) as ultimo_evento,
-            MIN(te.timestamp) as primeiro_evento,
-            pm.marketplace_origem as marketplace,
+            ARRAY_AGG(DISTINCT te.origem) AS origens,
+            MAX(te.timestamp)             AS ultimo_evento,
+            MIN(te.timestamp)             AS primeiro_evento,
+            pm.marketplace_origem         AS marketplace,
             pm.loja,
             pm.id_anymarket,
             pm.id_jet,
             pm.id_onclick,
-            pm.prazo_despacho
+            pm.prazo_despacho,
+            EXTRACT(EPOCH FROM (NOW() - MAX(te.timestamp))) / 3600          AS horas_sem_update,
+            CASE
+              WHEN pm.prazo_despacho IS NOT NULL
+              THEN EXTRACT(EPOCH FROM (pm.prazo_despacho - NOW())) / 3600
+              ELSE NULL
+            END AS horas_ate_prazo
           FROM tracking_events te
           LEFT JOIN pedidos_mapeamento pm ON te.pedido_id = pm.numero_marketplace
           ${baseWhere}
-          GROUP BY te.pedido_id, pm.marketplace_origem, pm.loja, pm.id_anymarket,
-                   pm.id_jet, pm.id_onclick, pm.prazo_despacho
+          GROUP BY te.pedido_id, pm.marketplace_origem, pm.loja,
+                   pm.id_anymarket, pm.id_jet, pm.id_onclick, pm.prazo_despacho
         )
-        SELECT 
-          pedido_id,
-          origens,
-          ultimo_evento,
-          primeiro_evento,
-          marketplace,
-          loja,
-          id_anymarket,
-          id_jet,
-          id_onclick,
-          prazo_despacho,
-          EXTRACT(EPOCH FROM (NOW() - ultimo_evento))/3600 as horas_sem_update,
-          CASE
-            WHEN prazo_despacho IS NOT NULL
-            THEN EXTRACT(EPOCH FROM (prazo_despacho - NOW()))/3600
-            ELSE NULL
-          END as horas_ate_prazo
+        SELECT *
         FROM eventos_pedido
-        ${travadosFiltro}
-        ORDER BY ultimo_evento DESC
+        WHERE 1=1
+          ${travadosFiltro}
+          ${quickFilterClause}
+        ORDER BY ${orderBy}
         LIMIT $${params.length + 1} OFFSET $${params.length + 2}
       `;
-      params.push(parseInt(limit), offset);
 
+      // ── Query de contagem total (com os mesmos filtros, sem paginação) ──
+      // Retorna também os totais para a barra de resumo do frontend.
       const countQuery = `
-        SELECT COUNT(DISTINCT te.pedido_id) as total
-        FROM tracking_events te
-        LEFT JOIN pedidos_mapeamento pm ON te.pedido_id = pm.numero_marketplace
-        ${baseWhere}
+        WITH eventos_pedido AS (
+          SELECT
+            te.pedido_id,
+            pm.prazo_despacho,
+            EXTRACT(EPOCH FROM (NOW() - MAX(te.timestamp))) / 3600 AS horas_sem_update
+          FROM tracking_events te
+          LEFT JOIN pedidos_mapeamento pm ON te.pedido_id = pm.numero_marketplace
+          ${baseWhere}
+          GROUP BY te.pedido_id, pm.prazo_despacho
+        )
+        SELECT
+          COUNT(*)                                                        AS total,
+          COUNT(*) FILTER (
+            WHERE (prazo_despacho IS NOT NULL AND prazo_despacho < NOW())
+               OR (prazo_despacho IS NULL AND horas_sem_update > 1)
+          )                                                               AS fora_prazo,
+          COUNT(*) FILTER (
+            WHERE prazo_despacho IS NOT NULL
+              AND prazo_despacho >= NOW()
+              AND prazo_despacho < NOW() + INTERVAL '24 hours'
+          )                                                               AS urgentes,
+          COUNT(*) FILTER (WHERE prazo_despacho IS NULL)                 AS sem_prazo
+        FROM eventos_pedido
+        WHERE 1=1
+          ${travadosFiltro}
+          ${quickFilterClause}
       `;
+
+      params.push(parseInt(limit), offset);
 
       const [pedidosResult, countResult] = await Promise.all([
         pool.query(pedidosQuery, params),
-        pool.query(countQuery, params.slice(0, -2))
+        pool.query(countQuery, params.slice(0, -2)),  // sem limit/offset
       ]);
 
-      const total = parseInt(countResult.rows[0].total);
+      const totais = countResult.rows[0];
+      const total  = parseInt(totais.total);
 
       res.json({
         success: true,
@@ -292,7 +340,14 @@ const DashboardController = {
         page: parseInt(page),
         limit: parseInt(limit),
         total,
-        totalPages: Math.ceil(total / parseInt(limit))
+        totalPages: Math.ceil(total / parseInt(limit)),
+        // Totais globais do filtro — usados na barra de resumo do frontend
+        summary: {
+          total,
+          foraPrazo: parseInt(totais.fora_prazo),
+          urgentes:  parseInt(totais.urgentes),
+          semPrazo:  parseInt(totais.sem_prazo),
+        },
       });
     } catch (error) {
       console.error('Erro getPedidosPipeline:', error);

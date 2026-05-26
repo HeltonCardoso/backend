@@ -39,12 +39,21 @@ function UploadPlanilha() {
 
   const handleUpload = async () => {
     if (!file) { setError('Selecione ou arraste um arquivo primeiro'); return; }
+
+    const token = localStorage.getItem('token');
+    if (!token) {
+      setError('Sessão expirada. Faça login novamente.');
+      return;
+    }
+
     setLoading(true);
     const formData = new FormData();
     formData.append('planilha', file);
-    const token = localStorage.getItem('token');
+
+    const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
+
     try {
-      const response = await fetch('http://localhost:3001/api/upload/compare', {
+      const response = await fetch(`${API_URL}/upload/compare`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}` },
         body: formData

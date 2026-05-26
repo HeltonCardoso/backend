@@ -27,9 +27,10 @@ function App() {
 
   const [anomalias, setAnomalias] = useState([]);
   const [pedidos, setPedidos] = useState([]);
+  const [pipelineSummary, setPipelineSummary] = useState({ total: 0, foraPrazo: 0, urgentes: 0, semPrazo: 0 });
   const [graficos, setGraficos] = useState({ porStatus: {}, porMarketplace: [], volumeHoras: [] });
   const [selectedOrder, setSelectedOrder] = useState(null);
-  const [filters, setFilters] = useState({ marketplace: '', travados: false, search: '', loja: '' });
+  const [filters, setFilters] = useState({ marketplace: '', travados: false, search: '', loja: '', sort: '', quickFilter: '' });
   const [currentPage, setCurrentPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
   const [notification, setNotification] = useState(null);
@@ -136,12 +137,18 @@ function App() {
     setLoading(true);
     try {
       let url = `${API_URL}/dashboard/pedidos?page=${currentPage}&limit=20`;
-      if (filters.marketplace) url += `&marketplace=${filters.marketplace}`;
-      if (filters.travados) url += `&travados=true`;
-      if (filters.loja) url += `&loja=${filters.loja}`;
+      if (filters.marketplace) url += `&marketplace=${encodeURIComponent(filters.marketplace)}`;
+      if (filters.travados)    url += `&travados=true`;
+      if (filters.loja)        url += `&loja=${encodeURIComponent(filters.loja)}`;
+      if (filters.sort)        url += `&sort=${filters.sort}`;
+      if (filters.quickFilter)  url += `&quickFilter=${filters.quickFilter}`;
       const r = await fetch(url);
       const d = await r.json();
-      if (d.success) { setPedidos(d.pedidos); setTotalPages(d.totalPages); }
+      if (d.success) {
+        setPedidos(d.pedidos);
+        setTotalPages(d.totalPages);
+        if (d.summary) setPipelineSummary(d.summary);
+      }
     } catch {}
     finally { setLoading(false); }
   }, [API_URL, currentPage, filters]);
@@ -271,11 +278,18 @@ function App() {
   const getOrigemColor = (o) => ({ ANYMARKET: '#3b82f6', JET: '#06b6d4', ONCLICK: '#f59e0b', RETORNO_JET: '#10b981', RETORNO_ANYMARKET: '#8b5cf6' })[o] || '#6b7280';
 
   const lojasUnicas = [...new Set(pedidos.map(p => p.loja).filter(Boolean))];
-  const filteredPedidos = pedidos.filter(p =>
-    !filters.search ||
-    p.pedido_id?.toLowerCase().includes(filters.search.toLowerCase()) ||
-    p.marketplace?.toLowerCase().includes(filters.search.toLowerCase())
-  );
+  const marketplacesUnicos = [...new Set(pedidos.map(p => p.marketplace).filter(Boolean))];
+
+  // Filtragem apenas local por texto — marketplace/loja/travados/sort são tratados pelo backend
+  // para garantir que o filtro age sobre TODOS os pedidos e não só os 20 da página atual.
+  const filteredPedidos = !filters.search ? pedidos : pedidos.filter(p => {
+    const q = filters.search.toLowerCase();
+    return (
+      p.pedido_id?.toLowerCase().includes(q) ||
+      p.marketplace?.toLowerCase().includes(q) ||
+      p.loja?.toLowerCase().includes(q)
+    );
+  });
 
   const navItems = [
     { id: 'overview', icon: '◈', label: 'Visão Geral' },
@@ -605,18 +619,72 @@ function App() {
                 </div>
                 <select value={filters.marketplace} onChange={(e) => setFilters({...filters, marketplace:e.target.value})} className="filter-select">
                   <option value="">Todos os marketplaces</option>
-                  {dashboardData.porMarketplace.map(mp => <option key={mp.marketplace} value={mp.marketplace}>{mp.marketplace}</option>)}
+                  {marketplacesUnicos.map(mp => <option key={mp} value={mp}>{mp}</option>)}
                 </select>
                 <select value={filters.loja} onChange={(e) => setFilters({...filters, loja:e.target.value})} className="filter-select">
                   <option value="">Todas as lojas</option>
                   {lojasUnicas.map(loja => <option key={loja} value={loja}>{loja}</option>)}
                 </select>
-                <label className="toggle-wrap">
-                  <input type="checkbox" checked={filters.travados} onChange={(e) => setFilters({...filters, travados:e.target.checked})} />
-                  <span className="toggle-slider" />
-                  <span className="toggle-label">Fora do prazo</span>
-                </label>
-                <button onClick={() => setFilters({ marketplace:'', travados:false, search:'', loja:'' })} className="clear-btn">Limpar</button>
+                <select value={filters.sort} onChange={(e) => setFilters({...filters, sort:e.target.value})} className="filter-select">
+                  <option value="">Ordenar por...</option>
+                  <option value="prazo_asc">⏰ Prazo mais urgente primeiro</option>
+                  <option value="prazo_desc">🔴 Mais atrasados primeiro</option>
+                  <option value="parado_desc">🕐 Parado há mais tempo</option>
+                </select>
+                <button onClick={() => setFilters({ marketplace:'', travados:false, search:'', loja:'', sort:'', quickFilter:'' })} className="clear-btn">Limpar</button>
+              </div>
+
+              {/* Contadores clicáveis — clique para filtrar, clique de novo para desfiltrar */}
+              <div className="pipeline-summary-bar">
+                <button
+                  className={`psb-btn ${!filters.quickFilter && !filters.travados ? 'psb-btn-active' : ''}`}
+                  onClick={() => setFilters(f => ({ ...f, quickFilter: '', travados: false }))}
+                  title="Ver todos os pedidos"
+                >
+                  <strong>{pipelineSummary.total}</strong>
+                  <span>total</span>
+                </button>
+                <span className="psb-divider" />
+                <button
+                  className={`psb-btn psb-danger ${filters.quickFilter === 'foraPrazo' ? 'psb-btn-active' : ''}`}
+                  onClick={() => setFilters(f => ({
+                    ...f,
+                    quickFilter: f.quickFilter === 'foraPrazo' ? '' : 'foraPrazo',
+                    travados: false,
+                    sort: f.quickFilter === 'foraPrazo' ? f.sort : 'prazo_desc',
+                  }))}
+                  title="Filtrar pedidos fora do prazo"
+                >
+                  <strong>{pipelineSummary.foraPrazo}</strong>
+                  <span>fora do prazo</span>
+                </button>
+                <span className="psb-divider" />
+                <button
+                  className={`psb-btn psb-warning ${filters.quickFilter === 'urgentes' ? 'psb-btn-active' : ''}`}
+                  onClick={() => setFilters(f => ({
+                    ...f,
+                    quickFilter: f.quickFilter === 'urgentes' ? '' : 'urgentes',
+                    travados: false,
+                    sort: f.quickFilter === 'urgentes' ? f.sort : 'prazo_asc',
+                  }))}
+                  title="Filtrar pedidos que vencem nas próximas 24h"
+                >
+                  <strong>{pipelineSummary.urgentes}</strong>
+                  <span>vencem em &lt;24h</span>
+                </button>
+                <span className="psb-divider" />
+                <button
+                  className={`psb-btn psb-muted ${filters.quickFilter === 'semPrazo' ? 'psb-btn-active' : ''}`}
+                  onClick={() => setFilters(f => ({
+                    ...f,
+                    quickFilter: f.quickFilter === 'semPrazo' ? '' : 'semPrazo',
+                    travados: false,
+                  }))}
+                  title="Filtrar pedidos sem prazo cadastrado"
+                >
+                  <strong>{pipelineSummary.semPrazo}</strong>
+                  <span>sem prazo</span>
+                </button>
               </div>
 
               <div className="table-panel">
@@ -633,8 +701,26 @@ function App() {
                           <th>IDs do Sistema</th>
                           <th>Estágio Atual</th>
                           <th>Último Evento</th>
-                          <th>Prazo / SLA</th>
-                          <th>Parado há</th>
+                          <th
+                            className={`th-sortable ${filters.sort.startsWith('prazo') ? 'th-active' : ''}`}
+                            onClick={() => setFilters(f => ({...f, sort: f.sort === 'prazo_asc' ? 'prazo_desc' : 'prazo_asc'}))}
+                            title="Clique para ordenar por prazo"
+                          >
+                            Prazo Prometido
+                            <span className="th-sort-icon">
+                              {filters.sort === 'prazo_asc' ? ' ↑' : filters.sort === 'prazo_desc' ? ' ↓' : ' ⇅'}
+                            </span>
+                          </th>
+                          <th
+                            className={`th-sortable ${filters.sort === 'parado_desc' ? 'th-active' : ''}`}
+                            onClick={() => setFilters(f => ({...f, sort: f.sort === 'parado_desc' ? '' : 'parado_desc'}))}
+                            title="Clique para ordenar por tempo parado"
+                          >
+                            Parado há
+                            <span className="th-sort-icon">
+                              {filters.sort === 'parado_desc' ? ' ↓' : ' ⇅'}
+                            </span>
+                          </th>
                           <th></th>
                         </tr>
                       </thead>
@@ -666,11 +752,21 @@ function App() {
                             <td className="date-cell">{formatDate(pedido.ultimo_evento)}</td>
                             <td>
                               {prazoInfo ? (
-                                <span className={`prazo-badge ${prazoInfo.atrasado ? 'prazo-atrasado' : 'prazo-ok'}`}>
-                                  {prazoInfo.atrasado ? `⚠ +${prazoInfo.label}` : `✓ ${prazoInfo.label}`}
-                                </span>
+                                <div className="prazo-cell">
+                                  <span className={`prazo-badge ${prazoInfo.atrasado ? 'prazo-atrasado' : (parseFloat(pedido.horas_ate_prazo) < 24 ? 'prazo-urgente' : 'prazo-ok')}`}>
+                                    {prazoInfo.atrasado
+                                      ? `⚠ Atrasado ${prazoInfo.label}`
+                                      : parseFloat(pedido.horas_ate_prazo) < 24
+                                        ? `⚡ ${prazoInfo.label} restantes`
+                                        : `✓ ${prazoInfo.label} restantes`
+                                    }
+                                  </span>
+                                  {pedido.prazo_despacho && (
+                                    <span className="prazo-data">{new Date(pedido.prazo_despacho).toLocaleDateString('pt-BR', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})}</span>
+                                  )}
+                                </div>
                               ) : (
-                                <span className="prazo-badge prazo-sem">—</span>
+                                <span className="prazo-badge prazo-sem">Sem prazo</span>
                               )}
                             </td>
                             <td>
@@ -860,7 +956,7 @@ function App() {
                   <span className="info-value">{selectedOrder.mapeamento?.loja || '—'}</span>
                 </div>
                 <div className="info-block">
-                  <span className="info-label">Prazo de Despacho</span>
+                  <span className="info-label">Prazo Prometido</span>
                   <span className={`info-value ${selectedOrder.mapeamento?.prazo_despacho && new Date(selectedOrder.mapeamento.prazo_despacho) < new Date() ? 'info-value-danger' : ''}`}>
                     {selectedOrder.mapeamento?.prazo_despacho ? formatDate(selectedOrder.mapeamento.prazo_despacho) : '—'}
                     {selectedOrder.mapeamento?.prazo_despacho && new Date(selectedOrder.mapeamento.prazo_despacho) < new Date() &&

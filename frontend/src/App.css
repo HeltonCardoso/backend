@@ -786,3 +786,100 @@ body {
 
 /* Valor em vermelho no modal quando vencido */
 .info-value-danger { color: var(--danger) !important; font-weight: 600; }
+/* ── Pipeline improvements ── */
+
+/* Prazo urgente (< 24h mas ainda no prazo) */
+.prazo-urgente { background: var(--warning-soft); color: var(--warning); }
+
+/* Célula de prazo com data abaixo */
+.prazo-cell { display: flex; flex-direction: column; gap: 2px; }
+.prazo-data { font-size: 10px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
+/* Cabeçalho de coluna clicável para ordenar */
+.th-sortable {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.th-sortable:hover { color: var(--accent); }
+.th-active { color: var(--accent) !important; }
+.th-sort-icon { font-size: 11px; opacity: 0.7; }
+
+/* Barra de resumo acima da tabela */
+.pipeline-summary-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-bottom: 12px;
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+.psb-item { color: var(--text-secondary); }
+.psb-item strong { color: var(--text-primary); }
+.psb-danger strong { color: var(--danger); }
+.psb-warning strong { color: var(--warning); }
+.psb-muted strong { color: var(--text-muted); }
+.psb-divider { width: 1px; height: 14px; background: var(--border); }
+
+/* ── Contadores clicáveis da summary bar ── */
+.psb-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 6px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.1s;
+  font-family: inherit;
+  line-height: 1.2;
+}
+.psb-btn strong {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.psb-btn span {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.psb-btn:hover {
+  background: var(--surface-2);
+  border-color: var(--border);
+}
+.psb-btn:active { transform: scale(0.97); }
+
+/* Estado ativo — contorno colorido por tipo */
+.psb-btn.psb-btn-active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+.psb-btn.psb-btn-active strong { color: var(--accent); }
+
+.psb-btn.psb-danger.psb-btn-active {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+}
+.psb-btn.psb-danger.psb-btn-active strong { color: var(--danger); }
+.psb-btn.psb-danger strong { color: var(--danger); }
+
+.psb-btn.psb-warning.psb-btn-active {
+  background: var(--warning-soft);
+  border-color: var(--warning);
+}
+.psb-btn.psb-warning.psb-btn-active strong { color: var(--warning); }
+.psb-btn.psb-warning strong { color: var(--warning); }
+
+.psb-btn.psb-muted strong { color: var(--text-muted); }
+.psb-btn.psb-muted.psb-btn-active {
+  background: var(--surface-2);
+  border-color: var(--border-2);
+}
+.psb-btn.psb-muted.psb-btn-active strong { color: var(--text-secondary); }

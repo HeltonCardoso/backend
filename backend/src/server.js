@@ -5,6 +5,7 @@ const express    = require("express");
 const cors       = require("cors");
 const cron       = require("node-cron");
 const path       = require("path");
+const syncRoutes = require('./routes/sync.routes');
 
 const app = express();
 
@@ -28,6 +29,7 @@ app.use("/api/webhooks", require("./routes/webhook.routes"));
 app.use("/api/dashboard", require("./routes/dashboard.routes"));
 app.use("/api/auth", require("./routes/auth.routes"));
 app.use("/api/upload", require("./routes/upload.routes"));
+app.use('/api/sync', syncRoutes);
 // Health check (necessário no Render)
 app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 // Adicione isso antes do app.listen

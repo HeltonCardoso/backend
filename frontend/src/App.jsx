@@ -36,6 +36,8 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [activeSection, setActiveSection] = useState('overview');
   const [backfillLoading, setBackfillLoading] = useState(false);
+  const [syncLoading,  setSyncLoading]  = useState(false);
+  const [syncProgress, setSyncProgress] = useState(null);
   const [lastRefresh, setLastRefresh] = useState(new Date());
 
   const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
@@ -152,6 +154,50 @@ function App() {
     } catch {}
   }, [API_URL]);
 
+
+
+  const handleSyncPrazos = async () => {
+  setSyncLoading(true);
+  setSyncProgress({ processados: 0, total: 0, percent: 0 });
+ 
+  try {
+    const token    = localStorage.getItem('token');
+    const response = await fetch(`${API_URL}/sync/prazos`, {
+      method:  'POST',
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+ 
+    const reader  = response.body.getReader();
+    const decoder = new TextDecoder();
+ 
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+ 
+      const lines = decoder.decode(value).split('\n');
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const evt = JSON.parse(line.slice(6));
+          if (evt.type === 'start')    setSyncProgress({ processados: 0, total: evt.total, percent: 0 });
+          if (evt.type === 'progress') setSyncProgress(evt);
+          if (evt.type === 'done') {
+            showNotification(`Sync concluído! ${evt.sucesso} prazos preenchidos.`);
+            setSyncProgress(null);
+            fetchMetricas(); // atualiza KPIs
+          }
+          if (evt.type === 'error') {
+            showNotification(`Erro: ${evt.message}`, 'error');
+          }
+        } catch {}
+      }
+    }
+  } catch {
+    showNotification('Erro ao conectar com o servidor', 'error');
+  } finally {
+    setSyncLoading(false);
+  }
+};
   const fetchPedidoDetalhes = async (pedidoId) => {
     try {
       const r = await fetch(`${API_URL}/dashboard/pedidos/${pedidoId}`);
@@ -201,6 +247,23 @@ function App() {
     if (diff < 60) return `há ${diff}s`;
     if (diff < 3600) return `há ${Math.floor(diff / 60)}min`;
     return `há ${Math.floor(diff / 3600)}h`;
+  };
+
+  // Formata prazo: retorna { atrasado, label, semPrazo }
+  const formatPrazo = (prazoDespacho, horasAtePrazo) => {
+    if (!prazoDespacho) return null;
+    const atrasado = horasAtePrazo < 0;
+    const horas    = Math.abs(horasAtePrazo ?? 0);
+    const dias     = Math.floor(horas / 24);
+    const h        = Math.floor(horas % 24);
+    const label    = dias > 0 ? `${dias}d ${h}h` : `${Math.floor(horas)}h`;
+    return { atrasado, label };
+  };
+
+  // Um pedido é "travado de verdade" se passou o prazo OU se não tem prazo e está parado > 1h
+  const isPedidoTravado = (pedido) => {
+    if (pedido.prazo_despacho) return pedido.horas_ate_prazo < 0;
+    return parseFloat(pedido.horas_sem_update || 0) > 1;
   };
 
   const traduzirOrigem = (o) => ({ ANYMARKET: 'Anymarket', JET: 'JET', ONCLICK: 'Onclick/ERP', RETORNO_JET: 'Ret. JET', RETORNO_ANYMARKET: 'Ret. Anymarket' })[o] || o;
@@ -304,7 +367,50 @@ function App() {
             <button className="topbar-btn backfill" onClick={handleBackfill} disabled={backfillLoading}>
               {backfillLoading ? '🔄 Importando...' : '📥 Importação pedidos 30 dias'}
             </button>
-            
+            <button
+  className="topbar-btn"
+  onClick={handleSyncPrazos}
+  disabled={syncLoading}
+  title="Buscar prazo de despacho na API Anymarket para pedidos sem prazo"
+>
+  {syncLoading ? (
+    <>
+      <span className="spinner" style={{ width: 13, height: 13, borderWidth: 2 }} />
+      {syncProgress?.percent ?? 0}%
+    </>
+  ) : (
+    <>
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+        <polyline points="23 4 23 10 17 10"/>
+        <polyline points="1 20 1 14 7 14"/>
+        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+      </svg>
+      Sync Prazos
+    </>
+  )}
+</button>
+ 
+{/* Barra de progresso do sync — aparece abaixo do topbar quando rodando */}
+{syncLoading && syncProgress && (
+  <div style={{
+    position: 'fixed', top: 'var(--topbar-h)', left: 0, right: 0,
+    background: 'var(--surface)', borderBottom: '1px solid var(--border)',
+    padding: '8px 20px', zIndex: 49,
+    display: 'flex', alignItems: 'center', gap: 12, fontSize: 13
+  }}>
+    <div style={{ flex: 1, height: 6, background: 'var(--border)', borderRadius: 3, overflow: 'hidden' }}>
+      <div style={{
+        height: '100%', borderRadius: 3, background: 'var(--accent)',
+        width: `${syncProgress.percent}%`, transition: 'width 0.3s'
+      }} />
+    </div>
+    <span style={{ color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+      {syncProgress.processados}/{syncProgress.total} pedidos
+      · ✓ {syncProgress.sucesso ?? 0} com prazo
+      · ✕ {syncProgress.erro ?? 0} erros
+    </span>
+  </div>
+)}
             <button className="topbar-btn" onClick={refreshAll}>
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
                 <path d="M1 4v6h6M23 20v-6h-6" />
@@ -508,7 +614,7 @@ function App() {
                 <label className="toggle-wrap">
                   <input type="checkbox" checked={filters.travados} onChange={(e) => setFilters({...filters, travados:e.target.checked})} />
                   <span className="toggle-slider" />
-                  <span className="toggle-label">Travados (+1h)</span>
+                  <span className="toggle-label">Fora do prazo</span>
                 </label>
                 <button onClick={() => setFilters({ marketplace:'', travados:false, search:'', loja:'' })} className="clear-btn">Limpar</button>
               </div>
@@ -527,13 +633,17 @@ function App() {
                           <th>IDs do Sistema</th>
                           <th>Estágio Atual</th>
                           <th>Último Evento</th>
+                          <th>Prazo / SLA</th>
                           <th>Parado há</th>
                           <th></th>
                         </tr>
                       </thead>
                       <tbody>
-                        {filteredPedidos.map((pedido) => (
-                          <tr key={pedido.pedido_id} className={`data-row ${pedido.horas_sem_update > 1 ? 'row-warning' : ''}`}>
+                        {filteredPedidos.map((pedido) => {
+                          const travado = isPedidoTravado(pedido);
+                          const prazoInfo = formatPrazo(pedido.prazo_despacho, pedido.horas_ate_prazo);
+                          return (
+                          <tr key={pedido.pedido_id} className={`data-row ${travado ? 'row-warning' : ''}`}>
                             <td><span className="mono-id">{pedido.pedido_id}</span></td>
                             <td><span className="mp-chip">{pedido.marketplace || '—'}</span></td>
                             <td className="loja-cell">{pedido.loja || '—'}</td>
@@ -555,7 +665,16 @@ function App() {
                             </td>
                             <td className="date-cell">{formatDate(pedido.ultimo_evento)}</td>
                             <td>
-                              <span className={`hours-badge ${pedido.horas_sem_update > 1 ? 'hours-danger' : 'hours-ok'}`}>
+                              {prazoInfo ? (
+                                <span className={`prazo-badge ${prazoInfo.atrasado ? 'prazo-atrasado' : 'prazo-ok'}`}>
+                                  {prazoInfo.atrasado ? `⚠ +${prazoInfo.label}` : `✓ ${prazoInfo.label}`}
+                                </span>
+                              ) : (
+                                <span className="prazo-badge prazo-sem">—</span>
+                              )}
+                            </td>
+                            <td>
+                              <span className={`hours-badge ${travado ? 'hours-danger' : 'hours-ok'}`}>
                                 {parseFloat(pedido.horas_sem_update || 0).toFixed(1)}h
                               </span>
                             </td>
@@ -563,10 +682,11 @@ function App() {
                               <button className="detail-btn" onClick={() => fetchPedidoDetalhes(pedido.pedido_id)}>Ver detalhes</button>
                             </td>
                           </tr>
-                        ))}
+                          );
+                        })}
                         {filteredPedidos.length === 0 && (
                           <tr>
-                            <td colSpan="8">
+                            <td colSpan="9">
                               <div className="empty-table">
                                 <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2M9 5a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2M9 5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2"/></svg>
                                 <p>Nenhum pedido encontrado</p>
@@ -738,6 +858,15 @@ function App() {
                 <div className="info-block">
                   <span className="info-label">Loja</span>
                   <span className="info-value">{selectedOrder.mapeamento?.loja || '—'}</span>
+                </div>
+                <div className="info-block">
+                  <span className="info-label">Prazo de Despacho</span>
+                  <span className={`info-value ${selectedOrder.mapeamento?.prazo_despacho && new Date(selectedOrder.mapeamento.prazo_despacho) < new Date() ? 'info-value-danger' : ''}`}>
+                    {selectedOrder.mapeamento?.prazo_despacho ? formatDate(selectedOrder.mapeamento.prazo_despacho) : '—'}
+                    {selectedOrder.mapeamento?.prazo_despacho && new Date(selectedOrder.mapeamento.prazo_despacho) < new Date() &&
+                      <span style={{ marginLeft: 6, fontSize: 11, fontWeight: 700, color: 'var(--danger)' }}>VENCIDO</span>
+                    }
+                  </span>
                 </div>
                 <div className="info-block">
                   <span className="info-label">ID Anymarket</span>

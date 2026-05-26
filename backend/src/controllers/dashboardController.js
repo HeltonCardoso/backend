@@ -223,6 +223,12 @@ const DashboardController = {
         baseWhere += ` AND pm.loja = $${params.length}`;
       }
 
+      const travadosFiltro = travados === 'true'
+        ? `WHERE horas_sem_update > 1
+             AND NOT ('RETORNO_ANYMARKET' = ANY(origens))
+             AND (prazo_despacho IS NULL OR prazo_despacho < NOW())`
+        : '';
+
       const pedidosQuery = `
         WITH eventos_pedido AS (
           SELECT 
@@ -234,11 +240,13 @@ const DashboardController = {
             pm.loja,
             pm.id_anymarket,
             pm.id_jet,
-            pm.id_onclick
+            pm.id_onclick,
+            pm.prazo_despacho
           FROM tracking_events te
           LEFT JOIN pedidos_mapeamento pm ON te.pedido_id = pm.numero_marketplace
           ${baseWhere}
-          GROUP BY te.pedido_id, pm.marketplace_origem, pm.loja, pm.id_anymarket, pm.id_jet, pm.id_onclick
+          GROUP BY te.pedido_id, pm.marketplace_origem, pm.loja, pm.id_anymarket,
+                   pm.id_jet, pm.id_onclick, pm.prazo_despacho
         )
         SELECT 
           pedido_id,
@@ -250,9 +258,15 @@ const DashboardController = {
           id_anymarket,
           id_jet,
           id_onclick,
-          EXTRACT(EPOCH FROM (NOW() - ultimo_evento))/3600 as horas_sem_update
+          prazo_despacho,
+          EXTRACT(EPOCH FROM (NOW() - ultimo_evento))/3600 as horas_sem_update,
+          CASE
+            WHEN prazo_despacho IS NOT NULL
+            THEN EXTRACT(EPOCH FROM (prazo_despacho - NOW()))/3600
+            ELSE NULL
+          END as horas_ate_prazo
         FROM eventos_pedido
-        ${travados === 'true' ? `WHERE EXTRACT(EPOCH FROM (NOW() - ultimo_evento))/3600 > 1 AND NOT ('RETORNO_ANYMARKET' = ANY(origens))` : ''}
+        ${travadosFiltro}
         ORDER BY ultimo_evento DESC
         LIMIT $${params.length + 1} OFFSET $${params.length + 2}
       `;

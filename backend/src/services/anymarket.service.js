@@ -1,3 +1,4 @@
+// backend/src/services/anymarket.service.js
 const axios = require("axios");
 const db = require("../models/db");
 
@@ -14,13 +15,37 @@ const api = axios.create({
 });
 
 // ─── BUSCAR PEDIDOS DA API ────────────────────────────────────────────────────
-async function fetchOrders({ status = "APPROVED", limit = 50, offset = 0, since } = {}) {
-  const params = { limit, offset };
-  if (status) params.situationCode = status;
-  if (since) params.createdAfter = since;
-
-  const { data } = await api.get("/orders", { params });
-  return data.content || data || [];
+async function fetchOrders(params) {
+  // Garante limit mínimo
+  if (params.limit && params.limit < 5) {
+    params.limit = 5;
+  }
+  
+  console.log(`[AnyMarket API] Buscando pedidos com:`, params);
+  
+  try {
+    const response = await api.get('/orders', { params });
+    
+    // A API retorna { content: [...], page: {...}, links: [...] }
+    const orders = response.data?.content || [];
+    
+    console.log(`[AnyMarket API] Resposta: ${orders.length} pedidos encontrados (Total disponível: ${response.data?.page?.totalElements || 0})`);
+    
+    if (orders.length > 0) {
+      console.log(`[AnyMarket API] Primeiro pedido:`, {
+        id: orders[0].id,
+        marketPlaceId: orders[0].marketPlaceId,
+        marketPlace: orders[0].marketPlace,
+        createdAt: orders[0].createdAt,
+        status: orders[0].status
+      });
+    }
+    
+    return orders;
+  } catch (error) {
+    console.error(`[AnyMarket API] Erro:`, error.response?.data || error.message);
+    throw error;
+  }
 }
 
 // Busca pedido individual
@@ -31,14 +56,12 @@ async function fetchOrder(anymarketId) {
 
 // ─── SINCRONIZAR PEDIDOS COM O BANCO ─────────────────────────────────────────
 async function syncOrders(since) {
-  // Se não passar since, busca últimas 72h
   const sinceDate = since || new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
-  
-  const orders = await fetchOrders({ since: sinceDate });
+  const orders = await fetchOrders({ since: sinceDate, limit: 50 });
   let upserted = 0;
 
   for (const o of orders) {
-    upsertOrder(o);
+    await upsertOrder(o);
     upserted++;
   }
 
@@ -56,15 +79,16 @@ function mapStatus(anymarketStatus) {
     "CANCELED": "cancelled",
     "WAITING_PAYMENT": "new",
     "PAYMENT_ANALYSIS": "new",
+    "PAID_WAITING_SHIP": "paid",
   };
   return map[anymarketStatus] || "anymarket";
 }
 
 // ─── SALVAR/ATUALIZAR PEDIDO NO BANCO ─────────────────────────────────────────
-function upsertOrder(o) {
+async function upsertOrder(o) {
   const existing = db.prepare("SELECT id FROM orders WHERE anymarket_id = ?").get(String(o.id));
   const now = new Date().toISOString();
-  const status = mapStatus(o.situationCode);
+  const status = mapStatus(o.status || o.situationCode);
 
   if (existing) {
     db.prepare(`
@@ -78,10 +102,11 @@ function upsertOrder(o) {
       calcSla(o.createdAt || o.created_at || now),
       now,
       String(o.marketPlaceId || o.marketplaceOrderId || ""),
-      o.invoicedAt || null,
+      o.invoicedAt || o.paymentDate || null,
       JSON.stringify(o),
       String(o.id)
     );
+    console.log(`[Upsert] Pedido ${o.id} atualizado`);
   } else {
     db.prepare(`
       INSERT INTO orders
@@ -90,30 +115,32 @@ function upsertOrder(o) {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       `AM-${o.id}`,
-      o.marketplaceName || o.channel || "Desconhecido",
+      o.marketPlace || o.marketplaceName || o.channel || "Desconhecido",
       String(o.marketPlaceId || o.marketplaceOrderId || ""),
       String(o.id),
-      parseFloat(o.totalAmount || o.total || 0),
+      parseFloat(o.total || o.totalAmount || 0),
       status,
       calcSla(o.createdAt || o.created_at || now),
       o.createdAt || o.created_at || now,
       now,
       JSON.stringify(o)
     );
+    console.log(`[Upsert] Pedido ${o.id} inserido`);
   }
 
   // Registra evento
   db.prepare(`
     INSERT INTO order_events (order_id, step, event_type, payload, source, occurred_at)
     VALUES (?, 'anymarket', 'processed', ?, 'api_poll', ?)
-  `).run(`AM-${o.id}`, JSON.stringify({ status: o.situationCode }), now);
+  `).run(`AM-${o.id}`, JSON.stringify({ status: o.status, situationCode: o.situationCode }), now);
+  
+  return existing ? "updated" : "inserted";
 }
 
 // ─── PROCESSAR WEBHOOK ───────────────────────────────────────────────────────
 function processWebhook(payload) {
   const now = new Date().toISOString();
 
-  // Loga o webhook
   const logId = db.prepare(`
     INSERT INTO webhook_log (source, event_type, payload, received_at)
     VALUES ('anymarket', ?, ?, ?)
@@ -132,7 +159,6 @@ function processWebhook(payload) {
         WHERE anymarket_id = ?
       `).run(status, calcSla(existing.created_at), now, String(orderId));
     } else {
-      // Pedido novo via webhook - salva o básico e agenda busca completa
       db.prepare(`
         INSERT INTO orders (order_id, marketplace, anymarket_id, value, status, sla_status, created_at, updated_at, raw_data)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -148,13 +174,11 @@ function processWebhook(payload) {
       );
     }
 
-    // Registra evento
     db.prepare(`
       INSERT INTO order_events (order_id, step, event_type, payload, source, occurred_at)
       VALUES (?, 'anymarket', 'received', ?, 'webhook', ?)
     `).run(`AM-${orderId}`, JSON.stringify(payload), now);
 
-    // Marca webhook como processado
     db.prepare("UPDATE webhook_log SET processed = 1 WHERE id = ?").run(logId);
     
     return { ok: true, orderId };

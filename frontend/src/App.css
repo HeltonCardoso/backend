@@ -883,3 +883,101 @@ body {
   border-color: var(--border-2);
 }
 .psb-btn.psb-muted.psb-btn-active strong { color: var(--text-secondary); }
+
+/* ═══════════════════════════════════════
+   SKELETON LOADING
+═══════════════════════════════════════ */
+@keyframes shimmer {
+  0%   { background-position: -600px 0; }
+  100% { background-position:  600px 0; }
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--surface-2) 25%,
+    var(--border)    50%,
+    var(--surface-2) 75%
+  );
+  background-size: 600px 100%;
+  animation: shimmer 1.5s infinite linear;
+  border-radius: var(--radius-xs);
+  display: block;
+}
+
+/* KPI skeleton */
+.kpi-card-skeleton {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+  position: relative;
+}
+.kpi-card-skeleton::after {
+  content: '';
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  height: 3px;
+  background: var(--border);
+}
+
+/* Pipeline skeleton */
+.pipeline-stage-skeleton {
+  flex: 1;
+  min-width: 100px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+}
+
+/* Table skeleton */
+.skeleton-row td { padding: 11px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.skeleton-row:last-child td { border-bottom: none; }
+
+/* Panel skeleton (marketplace list, status platforms) */
+.panel-skeleton-list { padding: 12px 18px; display: flex; flex-direction: column; gap: 12px; }
+.panel-skeleton-row  { display: flex; align-items: center; gap: 10px; }
+
+/* Volume chart skeleton */
+.volume-chart-skeleton {
+  padding: 14px 18px;
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 148px;
+}
+.volume-bar-skeleton {
+  flex: 1;
+  border-radius: 3px 3px 0 0;
+}
+
+/* Anomalias skeleton */
+.anomalia-card-skeleton {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: var(--shadow-sm);
+}
+
+/* Summary bar skeleton */
+.psb-skeleton {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-bottom: 12px;
+}

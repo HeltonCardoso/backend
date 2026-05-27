@@ -17,20 +17,50 @@ const DashboardController = {
 
   async getMetricasGerais(req, res) {
     try {
+      // CORRIGIDO: Ordem correta do pipeline baseada no nível de progresso
       const origemResult = await pool.query(`
-        SELECT origem, COUNT(DISTINCT te.pedido_id) AS total
-        FROM tracking_events te
-        WHERE origem IN ('ANYMARKET','JET','ONCLICK','RETORNO_JET','RETORNO_ANYMARKET')
-          AND te.pedido_id NOT IN (
+        WITH niveis_origem AS (
+          SELECT DISTINCT ON (te.pedido_id)
+            te.pedido_id,
+            CASE 
+              -- Prioridade: maior número = mais avançado
+              -- Ordem correta do fluxo: ANYMARKET(1) → JET(2) → ONCLICK(3) → RETORNO_JET(4) → RETORNO_ANYMARKET(5)
+              WHEN te.origem = 'RETORNO_ANYMARKET' THEN 5
+              WHEN te.origem = 'RETORNO_JET' THEN 4
+              WHEN te.origem = 'ONCLICK' THEN 3
+              WHEN te.origem = 'JET' THEN 2
+              WHEN te.origem = 'ANYMARKET' THEN 1
+              ELSE 0
+            END as prioridade,
+            te.origem as origem_atual
+          FROM tracking_events te
+          WHERE te.pedido_id NOT IN (
             SELECT pedido_id FROM tracking_events 
             WHERE origem = 'ANYMARKET' 
             AND status IN ('ENTREGUE', 'CANCELADO', 'CONCLUDED', 'CANCELED')
           )
-        GROUP BY origem
+          ORDER BY te.pedido_id, prioridade DESC, te.timestamp DESC
+        )
+        SELECT 
+          origem_atual as origem,
+          COUNT(*) as total
+        FROM niveis_origem
+        WHERE origem_atual IS NOT NULL
+        GROUP BY origem_atual
       `);
       
-      const metricas = { ANYMARKET: 0, JET: 0, ONCLICK: 0, RETORNO_JET: 0, RETORNO_ANYMARKET: 0 };
-      origemResult.rows.forEach(r => { metricas[r.origem] = parseInt(r.total); });
+      // Garantir que TODAS as origens existam no objeto (mesmo com 0)
+      const metricas = { 
+        ANYMARKET: 0, 
+        JET: 0, 
+        ONCLICK: 0, 
+        RETORNO_JET: 0,
+        RETORNO_ANYMARKET: 0
+      };
+      
+      origemResult.rows.forEach(r => { 
+        metricas[r.origem] = parseInt(r.total); 
+      });
 
       const anomaliasResult = await pool.query(
         `SELECT COUNT(*) AS total FROM anomalias WHERE resolvida = false`
@@ -55,7 +85,15 @@ const DashboardController = {
         SELECT origem as estagio, COUNT(*) as total
         FROM ultimo_estagio
         GROUP BY origem
-        ORDER BY total DESC
+        ORDER BY 
+          CASE 
+            WHEN origem = 'ANYMARKET' THEN 1
+            WHEN origem = 'JET' THEN 2
+            WHEN origem = 'ONCLICK' THEN 3
+            WHEN origem = 'RETORNO_JET' THEN 4
+            WHEN origem = 'RETORNO_ANYMARKET' THEN 5
+            ELSE 6
+          END
       `);
       
       const porEstagio = {};
@@ -89,10 +127,8 @@ const DashboardController = {
           AND u.origem NOT IN ('RETORNO_ANYMARKET','RETORNO_MARKETPLACE')
           AND u.status NOT IN ('ENTREGUE', 'CANCELADO', 'CONCLUDED', 'CANCELED')
           AND (
-            -- Caso 1: Tem prazo e passou do prazo
             (u.prazo_despacho IS NOT NULL AND NOW() > u.prazo_despacho)
             OR
-            -- Caso 2: Não tem prazo e está parado há mais de 1 hora
             (u.prazo_despacho IS NULL AND u.timestamp < NOW() - INTERVAL '1 hour')
           )
       `);

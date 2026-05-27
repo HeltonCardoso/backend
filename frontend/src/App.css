@@ -981,3 +981,71 @@ body {
   border-radius: var(--radius-sm);
   margin-bottom: 12px;
 }
+
+.pipeline-stage {
+  position: relative;
+  transition: all 0.3s ease;
+}
+
+.pipeline-stage:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.12);
+}
+
+.stage-desc {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 8px;
+  opacity: 0.7;
+  transition: opacity 0.2s;
+}
+
+.pipeline-stage:hover .stage-desc {
+  opacity: 1;
+}
+
+.pipeline-arrow {
+  font-size: 1.25rem;
+  color: var(--text-muted);
+  font-weight: 300;
+  margin: 0 0.5rem;
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+
+/* Tooltip para os estágios */
+.pipeline-stage[title] {
+  cursor: help;
+}
+
+/* Responsivo para mobile */
+@media (max-width: 768px) {
+  .pipeline-flow {
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+  
+  .pipeline-arrow {
+    transform: rotate(90deg);
+    margin: 0.25rem 0;
+  }
+  
+  .pipeline-stage {
+    width: 100%;
+  }
+  
+  .stage-desc {
+    display: none;
+  }
+}
+
+/* Destaque para o estágio ativo (se quiser marcar o estágio majoritário) */
+.pipeline-stage.active {
+  border: 2px solid var(--stage-color);
+  background: linear-gradient(135deg, var(--surface) 0%, var(--stage-color) 100%);
+  background-blend-mode: overlay;
+}

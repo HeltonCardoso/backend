@@ -309,6 +309,7 @@ function App() {
       if (filters.loja)        url += `&loja=${encodeURIComponent(filters.loja)}`;
       if (filters.sort)        url += `&sort=${filters.sort}`;
       if (filters.quickFilter) url += `&quickFilter=${filters.quickFilter}`;
+      if (filters.search)      url += `&search=${encodeURIComponent(filters.search)}`;
       const r = await fetch(url);
       const d = await r.json();
       if (d.success) {
@@ -430,8 +431,51 @@ function App() {
     return parseFloat(pedido.horas_sem_update || 0) > 1;
   };
 
-  const traduzirOrigem   = (o) => ({ ANYMARKET: 'Anymarket', JET: 'JET', ONCLICK: 'Onclick/ERP', RETORNO_JET: 'Ret. JET', RETORNO_ANYMARKET: 'Ret. Anymarket' })[o] || o;
-  const getOrigemColor   = (o) => ({ ANYMARKET: '#3b82f6', JET: '#06b6d4', ONCLICK: '#f59e0b', RETORNO_JET: '#10b981', RETORNO_ANYMARKET: '#8b5cf6' })[o] || '#6b7280';
+  // ═══════════════════════════════════════════════════════════════
+  // FUNÇÕES CORRIGIDAS PARA O FLUXO CORRETO DO PIPELINE
+  // ═══════════════════════════════════════════════════════════════
+  
+  const traduzirOrigem = (origem) => {
+    const nomes = {
+      'ANYMARKET': 'Anymarket',
+      'JET': 'JET',
+      'ONCLICK': 'Onclick/ERP',
+      'RETORNO_JET': 'Retorno JET',
+      'RETORNO_ANYMARKET': 'Retorno Anymarket'
+    };
+    return nomes[origem] || origem;
+  };
+
+  const getOrigemColor = (origem) => {
+    const colors = {
+      'ANYMARKET': '#3b82f6',        // Azul - Início
+      'JET': '#06b6d4',              // Ciano - Integração
+      'ONCLICK': '#f59e0b',          // Âmbar - Processamento
+      'RETORNO_JET': '#10b981',      // Verde - Confirmação
+      'RETORNO_ANYMARKET': '#8b5cf6' // Roxo - Conclusão
+    };
+    return colors[origem] || '#6b7280';
+  };
+
+  const getStageDescription = (stage) => {
+    const descriptions = {
+      'ANYMARKET': '📥 Pedido recebido via webhook - Aguardando integração com JET',
+      'JET': '🔄 Pedido integrado com a JET - Aguardando processamento no ERP',
+      'ONCLICK': '📦 Pedido processado no ERP - Aguardando confirmação da JET',
+      'RETORNO_JET': '✅ JET confirma recebimento do faturamento - Quase concluído',
+      'RETORNO_ANYMARKET': '🏁 Fluxo concluído - Pedido finalizado no Anymarket'
+    };
+    return descriptions[stage] || '';
+  };
+
+  // Ordem correta do pipeline (fluxo real)
+  const pipelineStages = [
+    { key: 'ANYMARKET',         icon: '◉', label: 'Anymarket',        ordem: 1, description: 'Pedido recebido' },
+    { key: 'JET',               icon: '⬡', label: 'JET',              ordem: 2, description: 'Integração JET' },
+    { key: 'ONCLICK',           icon: '▣', label: 'Onclick / ERP',    ordem: 3, description: 'Processamento ERP' },
+    { key: 'RETORNO_JET',       icon: '↺', label: 'Retorno JET',      ordem: 4, description: 'Confirmação JET' },
+    { key: 'RETORNO_ANYMARKET', icon: '✓', label: 'Retorno Anymarket', ordem: 5, description: 'Concluído' }
+  ];
 
   const lojasUnicas        = [...new Set(pedidos.map(p => p.loja).filter(Boolean))];
   const marketplacesUnicos = [...new Set(pedidos.map(p => p.marketplace).filter(Boolean))];
@@ -713,23 +757,21 @@ function App() {
                 )}
               </div>
 
-              {/* Pipeline Flow */}
+              {/* Pipeline Flow - CORRIGIDO COM A ORDEM CERTA */}
               <div className="panel">
                 <div className="panel-header">
                   <h2 className="panel-title">Pipeline em Tempo Real</h2>
-                  <span className="panel-badge">Ativos</span>
+                  <span className="panel-badge">Fluxo: Anymarket → JET → ERP → Retorno JET → Conclusão</span>
                 </div>
                 {initialLoading ? <SkeletonPipeline /> : (
                   <div className="pipeline-flow">
-                    {[
-                      { key: 'ANYMARKET',         icon: '◉', label: 'Anymarket'     },
-                      { key: 'JET',               icon: '⬡', label: 'JET'           },
-                      { key: 'ONCLICK',           icon: '▣', label: 'Onclick / ERP' },
-                      { key: 'RETORNO_JET',       icon: '↺', label: 'Retorno JET'   },
-                      { key: 'RETORNO_ANYMARKET', icon: '✓', label: 'Concluído'     },
-                    ].map((stage, i) => (
+                    {pipelineStages.map((stage, i, arr) => (
                       <React.Fragment key={stage.key}>
-                        <div className="pipeline-stage" style={{ '--stage-color': getOrigemColor(stage.key) }}>
+                        <div 
+                          className="pipeline-stage" 
+                          style={{ '--stage-color': getOrigemColor(stage.key) }}
+                          title={getStageDescription(stage.key)}
+                        >
                           <div className="stage-icon">{stage.icon}</div>
                           <div className="stage-count">{dashboardData.metricas[stage.key] || 0}</div>
                           <div className="stage-label">{stage.label}</div>
@@ -739,8 +781,9 @@ function App() {
                               background: getOrigemColor(stage.key)
                             }} />
                           </div>
+                          <div className="stage-desc">{stage.description}</div>
                         </div>
-                        {i < 4 && <div className="pipeline-arrow">→</div>}
+                        {i < arr.length - 1 && <div className="pipeline-arrow">→</div>}
                       </React.Fragment>
                     ))}
                   </div>
@@ -827,7 +870,7 @@ function App() {
                   <input
                     type="text"
                     className="search-input"
-                    placeholder="Buscar por pedido ou marketplace..."
+                    placeholder="Buscar por pedido, marketplace ou loja..."
                     value={filters.search}
                     onChange={(e) => setFilters({ ...filters, search: e.target.value })}
                   />
@@ -967,11 +1010,23 @@ function App() {
                             </td>
                             <td>
                               <div className="stage-chips">
-                                {pedido.origens?.map(orig => (
-                                  <span key={orig} className="stage-chip" style={{ background: getOrigemColor(orig) + '22', color: getOrigemColor(orig), borderColor: getOrigemColor(orig) + '44' }}>
-                                    {traduzirOrigem(orig)}
-                                  </span>
-                                ))}
+                                {pedido.origens?.map(orig => {
+                                  const stageInfo = pipelineStages.find(s => s.key === orig);
+                                  return (
+                                    <span 
+                                      key={orig} 
+                                      className="stage-chip" 
+                                      style={{ 
+                                        background: getOrigemColor(orig) + '22', 
+                                        color: getOrigemColor(orig), 
+                                        borderColor: getOrigemColor(orig) + '44' 
+                                      }}
+                                      title={stageInfo?.description || ''}
+                                    >
+                                      {traduzirOrigem(orig)}
+                                    </span>
+                                  );
+                                })}
                               </div>
                             </td>
                             <td className="date-cell">{formatDate(pedido.ultimo_evento)}</td>
@@ -1217,7 +1272,7 @@ function App() {
                         <div className="timeline-dot" style={{ background: getOrigemColor(event.origem) }} />
                         <div className="timeline-content">
                           <div className="timeline-top">
-                            <span className="timeline-origem" style={{ color: getOrigemColor(event.origem) }}>{event.origem}</span>
+                            <span className="timeline-origem" style={{ color: getOrigemColor(event.origem) }}>{traduzirOrigem(event.origem)}</span>
                             <span className="timeline-status">{event.status}</span>
                           </div>
                           <span className="timeline-time">{formatDate(event.timestamp)}</span>

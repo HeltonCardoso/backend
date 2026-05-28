@@ -1,4 +1,6 @@
 // frontend/src/components/MercadoLivreConnection.jsx
+// Correção nome do arquivo
+
 import React, { useState, useEffect } from 'react';
 
 function MercadoLivreConnection() {

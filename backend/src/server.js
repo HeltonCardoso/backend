@@ -33,9 +33,11 @@ app.use("/api/dashboard", require("./routes/dashboard.routes"));
 app.use("/api/auth", require("./routes/auth.routes"));
 app.use("/api/upload", require("./routes/upload.routes"));
 app.use('/api/sync', syncRoutes);
+
 // Health check (necessário no Render)
 app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
-// Adicione isso antes do app.listen
+
+// Rota para testar DB
 app.get('/api/test-db', async (req, res) => {
   try {
     const pool = require('../config/database');
@@ -74,6 +76,20 @@ cron.schedule("0 * * * *", () => {
   }
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// 🚨 PARTE CRUCIAL PARA O REACT - ADICIONE ISSO!
+// ════════════════════════════════════════════════════════════════════════════
+
+// Servir os arquivos estáticos do React (build do Vite)
+// O caminho './dist' é onde o Vite gera os arquivos
+app.use(express.static(path.join(__dirname, 'dist')));
+
+// ROTA CORINGA - deve ser a ÚLTIMA rota do arquivo
+// Isso faz com que qualquer rota não encontrada sirva o index.html
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+});
+
 // ─── ERROR HANDLER ────────────────────────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error("[Error]", err.message);
@@ -89,6 +105,7 @@ app.listen(PORT, () => {
   console.log(`   Webhook Anymarket: http://localhost:${PORT}/api/webhooks/anymarket`);
   console.log(`   Webhook JET:       http://localhost:${PORT}/api/webhooks/jet`);
   console.log(`   Backfill:          POST http://localhost:${PORT}/api/backfill/all\n`);
+  console.log(`   📱 Frontend React disponível em: http://localhost:${PORT}`);
 });
 
 module.exports = app;

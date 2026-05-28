@@ -11,7 +11,8 @@ function MercadoLivreConnection() {
     const [connectionInfo, setConnectionInfo] = useState(null);
     const [syncProgress, setSyncProgress] = useState(null);
     
-    const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
+    //const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
+    const API_URL = '/api';
     
     // Verificar status da conexão
     const checkConnection = async () => {

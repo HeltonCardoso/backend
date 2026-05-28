@@ -3,7 +3,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import './App.css';
 import Login from './components/Login';
 import UploadPlanilha from './components/UploadPlanilha';
-import MercadoLivreConnection from './components/MercadolivreConnection';
+import MercadoLivreConnection from './components/MercadoLivreConnection';
 
 const AUTO_REFRESH_SECONDS = 600;
 

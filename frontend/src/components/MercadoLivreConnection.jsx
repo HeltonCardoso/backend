@@ -1,5 +1,4 @@
 // frontend/src/components/MercadoLivreConnection.jsx
-// Correção nome do arquivo
 
 import React, { useState, useEffect } from 'react';
 
@@ -7,6 +6,8 @@ function MercadoLivreConnection() {
     const [isConnected, setIsConnected] = useState(false);
     const [loading, setLoading] = useState(false);
     const [syncing, setSyncing] = useState(false);
+    const [cancelRequested, setCancelRequested] = useState(false);
+    const [abortController, setAbortController] = useState(null);  // ← Adicionado
     const [connectionInfo, setConnectionInfo] = useState(null);
     const [syncProgress, setSyncProgress] = useState(null);
     
@@ -58,7 +59,7 @@ function MercadoLivreConnection() {
         const timer = setInterval(() => {
             if (authWindow.closed) {
                 clearInterval(timer);
-                checkConnection(); // Recarregar status
+                checkConnection();
             }
         }, 500);
     };
@@ -87,14 +88,22 @@ function MercadoLivreConnection() {
         }
     };
     
-    // Sincronizar pedidos
+    // Sincronizar pedidos COM SUPORTE A CANCELAMENTO
     const syncOrders = async () => {
+        // Criar controller para cancelar requisição
+        const controller = new AbortController();
+        setAbortController(controller);
+        
         setSyncing(true);
+        setCancelRequested(false);
         setSyncProgress({ status: 'iniciando', percent: 0 });
         
         try {
             const response = await fetch(`${API_URL}/meli/sync-orders`, {
-                method: 'POST'
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ dias: 30 }),
+                signal: controller.signal  // ← Permite cancelar
             });
             
             // Se for streaming de progresso
@@ -140,11 +149,28 @@ function MercadoLivreConnection() {
                 }
             }
         } catch (error) {
-            console.error('Erro ao sincronizar:', error);
-            alert('❌ Erro ao sincronizar pedidos');
+            if (error.name === 'AbortError') {
+                console.log('[Sync] Cancelado pelo usuário');
+                setSyncProgress({ status: 'cancelado', percent: 0 });
+                alert('⚠️ Sincronização cancelada pelo usuário.');
+            } else {
+                console.error('Erro ao sincronizar:', error);
+                alert('❌ Erro ao sincronizar pedidos');
+            }
         } finally {
             setSyncing(false);
-            setSyncProgress(null);
+            setAbortController(null);
+            setCancelRequested(false);
+            setTimeout(() => setSyncProgress(null), 2000);
+        }
+    };
+    
+    // Função para cancelar
+    const cancelSync = () => {
+        if (abortController) {
+            abortController.abort();
+            setCancelRequested(true);
+            setSyncProgress({ ...syncProgress, status: 'cancelando' });
         }
     };
     
@@ -212,20 +238,30 @@ function MercadoLivreConnection() {
                     )}
                     
                     <div className="connection-actions">
-                        <button 
-                            className="sync-btn"
-                            onClick={syncOrders}
-                            disabled={syncing}
-                        >
-                            {syncing ? (
-                                <>
+                        {!syncing ? (
+                            <button 
+                                className="sync-btn"
+                                onClick={syncOrders}
+                            >
+                                🔄 Sincronizar Pedidos Agora
+                            </button>
+                        ) : (
+                            <>
+                                <button className="sync-btn syncing" disabled>
                                     <span className="spinner" />
                                     {syncProgress?.percent ? `${syncProgress.percent}%` : 'Sincronizando...'}
-                                </>
-                            ) : (
-                                '🔄 Sincronizar Pedidos Agora'
-                            )}
-                        </button>
+                                </button>
+                                
+                                {/* Botão CANCELAR */}
+                                <button 
+                                    className="cancel-btn"
+                                    onClick={cancelSync}
+                                    disabled={cancelRequested}
+                                >
+                                    {cancelRequested ? 'Cancelando...' : '❌ Cancelar'}
+                                </button>
+                            </>
+                        )}
                         
                         <button 
                             className="disconnect-btn"
@@ -406,6 +442,33 @@ function MercadoLivreConnection() {
                 
                 .sync-btn:hover:not(:disabled) {
                     background: #2563eb;
+                }
+                
+                .sync-btn.syncing {
+                    background: #9ca3af;
+                    cursor: not-allowed;
+                }
+                
+                .cancel-btn {
+                    background: #ef4444;
+                    color: white;
+                    border: none;
+                    padding: 12px 24px;
+                    border-radius: 8px;
+                    cursor: pointer;
+                    font-weight: 500;
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 8px;
+                }
+                
+                .cancel-btn:hover:not(:disabled) {
+                    background: #dc2626;
+                }
+                
+                .cancel-btn:disabled {
+                    opacity: 0.6;
+                    cursor: not-allowed;
                 }
                 
                 .disconnect-btn {

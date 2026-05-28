@@ -2,6 +2,7 @@
 const express = require('express');
 const router = express.Router();
 const meliAuthService = require('../services/meliAuth.service');
+const meliOrdersService = require('../services/meliOrders.service');
 const db = require('../../config/database');
 
 // Iniciar fluxo OAuth - redireciona para Mercado Livre
@@ -53,6 +54,8 @@ router.get('/callback', async (req, res) => {
                         if (window.opener) {
                             window.opener.postMessage({ type: 'meli_connected', success: true }, '*');
                         }
+                        // Tentar fechar automaticamente após 3 segundos
+                        setTimeout(() => window.close(), 3000);
                     </script>
                 </body>
             </html>
@@ -80,8 +83,7 @@ router.get('/status', async (req, res) => {
         if (token) {
             res.json({ 
                 connected: true, 
-                message: 'Conectado ao Mercado Livre',
-                expires_at: token.expires_at
+                message: 'Conectado ao Mercado Livre'
             });
         } else {
             res.json({ 
@@ -91,6 +93,50 @@ router.get('/status', async (req, res) => {
         }
     } catch (error) {
         res.status(500).json({ connected: false, error: error.message });
+    }
+});
+
+// 🆕 ROTA PARA SINCRONIZAR PEDIDOS
+router.post('/sync-orders', async (req, res) => {
+    const { dias = 30 } = req.body;
+    
+    // Configurar SSE (Server-Sent Events) para progresso
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    
+    let cancelled = false;
+    
+    // Detectar quando o cliente cancelar
+    req.on('close', () => {
+        cancelled = true;
+        console.log('[MeliOrders] Cliente cancelou a requisição');
+    });
+    
+    try {
+        // Criar controller para cancelamento
+        const controller = new AbortController();
+        
+        // Enviar evento de início
+        res.write(`data: ${JSON.stringify({ type: 'start', message: 'Iniciando sincronização...', dias })}\n\n`);
+        
+        // Executar sincronização
+        const result = await meliOrdersService.syncOrders(dias, controller.signal);
+        
+        if (!cancelled) {
+            res.write(`data: ${JSON.stringify({ type: 'done', ...result })}\n\n`);
+            res.end();
+        }
+    } catch (error) {
+        if (!cancelled) {
+            if (error.message === 'Sync cancelled') {
+                res.write(`data: ${JSON.stringify({ type: 'cancelled', message: 'Sincronização cancelada' })}\n\n`);
+            } else {
+                console.error('[MeliOrders] Erro na sincronização:', error);
+                res.write(`data: ${JSON.stringify({ type: 'error', message: error.message })}\n\n`);
+            }
+            res.end();
+        }
     }
 });
 

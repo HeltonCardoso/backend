@@ -6,6 +6,8 @@ const cors       = require("cors");
 const cron       = require("node-cron");
 const path       = require("path");
 const syncRoutes = require('./routes/sync.routes');
+const meliAuthRoutes = require('./routes/meliAuth.routes');
+const meliOrdersService = require('./services/meliOrders.service');
 
 const app = express();
 
@@ -13,6 +15,7 @@ const app = express();
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use('/api/meli', meliAuthRoutes);
 
 // Loga todas as requisições em dev
 if (process.env.NODE_ENV !== "production") {
@@ -49,6 +52,16 @@ app.get('/api/test-db', async (req, res) => {
       error: error.message 
     });
   }
+});
+
+// Rota para sincronizar pedidos
+app.post('/api/meli/sync-orders', async (req, res) => {
+    try {
+        const result = await meliOrdersService.syncOrders();
+        res.json(result);
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
 });
 
 // ─── CRON — recalcula SLA a cada hora ─────────────────────────────────────────

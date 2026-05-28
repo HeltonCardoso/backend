@@ -5,7 +5,7 @@ const DESCRICAO_ANOMALIA = {
   NAO_INTEGROU_JET:     'Pedido não chegou na JET dentro do prazo',
   NAO_FATUROU_ONCLICK:  'JET integrou mas Onclick não faturou',
   FATUROU_NAO_RETORNOU: 'Onclick faturou mas JET não confirmou envio',
-  FATURADO_APOS_ENVIO:  'AnyMarket ficou como Faturado após envio',
+  FATURADO_APOS_ENVIO:  'AnyMarket travado em faturado',
   ENVIADO_SEM_FATURAMENTO: 'JET enviou sem confirmação de faturamento',
   TRAVADO:              'Pedido sem atualização por mais de 1 hora',
   NAO_ENTROU_ONCLICK:   'JET integrou mas pedido não entrou na Onclick',

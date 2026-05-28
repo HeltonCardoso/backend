@@ -3,6 +3,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import './App.css';
 import Login from './components/Login';
 import UploadPlanilha from './components/UploadPlanilha';
+import MercadoLivreConnection from './components/MercadoLivreConnection';
 
 const AUTO_REFRESH_SECONDS = 600;
 
@@ -495,6 +496,7 @@ function App() {
     { id: 'anomalias', icon: '⚠', label: 'Anomalias', badge: dashboardData.anomaliasNaoResolvidas },
     { id: 'graficos',  icon: '▦', label: 'Gráficos' },
     { id: 'upload',    icon: '📤', label: 'Upload Planilha' },
+    { id: 'meli', icon: '🛒', label: 'Mercado Livre' },
   ];
 
   const maxVolume = Math.max(...(graficos.volumeHoras?.map(h => h.total) || [1]), 1);
@@ -1140,7 +1142,12 @@ function App() {
               </div>
             </div>
           )}
-
+          {/* ══════════════ MERCADO LIVRE ══════════════ */}
+          {activeSection === 'meli' && (
+              <div className="section-meli">
+                  <MercadoLivreConnection />
+              </div>
+          )}
           {/* ══════════════ GRÁFICOS ══════════════ */}
           {activeSection === 'graficos' && (
             <div className="section-graficos">

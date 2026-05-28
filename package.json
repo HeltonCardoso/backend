@@ -3,13 +3,12 @@
   "version": "1.0.0",
   "description": "Backend para monitoramento de pedidos",
   "main": "backend/src/server.js",
-  
   "scripts": {
-  "start": "node backend/src/server.js",
-  "dev": "nodemon backend/src/server.js",
-  "migrate": "node backend/migrations/run.js",
-  "build": "echo 'No build needed for backend'"
-},
+    "start": "node backend/src/server.js",
+    "dev": "nodemon backend/src/server.js",
+    "migrate": "node backend/migrations/run.js",
+    "build": "cd frontend && npm install && npm run build"
+  },
   "dependencies": {
     "axios": "^1.16.1",
     "bcryptjs": "^3.0.3",
@@ -28,7 +27,6 @@
   },
   "devDependencies": {
     "concurrently": "^8.2.2",
-    "nodemon": "^3.0.1",
-    "vite": "^8.0.14"
+    "nodemon": "^3.0.1"
   }
 }

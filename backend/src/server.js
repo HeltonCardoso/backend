@@ -82,12 +82,10 @@ cron.schedule("0 * * * *", () => {
 
 // Servir os arquivos estáticos do React (build do Vite)
 // O caminho './dist' é onde o Vite gera os arquivos
-app.use(express.static(path.join(__dirname, 'dist')));
+app.use(express.static(path.join(process.cwd(), 'frontend/dist')));
 
-// ROTA CORINGA - deve ser a ÚLTIMA rota do arquivo
-// Isso faz com que qualquer rota não encontrada sirva o index.html
 app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+  res.sendFile(path.join(process.cwd(), 'frontend/dist/index.html'));
 });
 
 // ─── ERROR HANDLER ────────────────────────────────────────────────────────────

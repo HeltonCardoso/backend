@@ -22,7 +22,9 @@ const STATUS_MAP = {
   'processing': 'PROCESSANDO',
   'shipped': 'ENVIADO',
   'delivered': 'ENTREGUE',
-  'cancelled': 'CANCELADO'
+  'cancelled': 'CANCELADO',
+  'approved': 'APROVADO',
+  'invoiced': 'FATURADO'
 };
 
 // Cache em memória
@@ -42,6 +44,11 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function buscarDetalhesPedido(idOrder, tentativa = 1) {
   const maxTentativas = 3;
 
+  if (!API_KEY) {
+    console.error('❌ JET_API_TOKEN não configurado');
+    return null;
+  }
+
   if (cachePedidos.has(idOrder)) {
     const cached = cachePedidos.get(idOrder);
     if (Date.now() - cached.timestamp < 86400000) {
@@ -55,7 +62,6 @@ async function buscarDetalhesPedido(idOrder, tentativa = 1) {
   for (let tentativaAtual = 1; tentativaAtual <= maxTentativas; tentativaAtual++) {
     try {
       console.log(`🔍 Buscando pedido JET ${idOrder} (tentativa ${tentativaAtual}/${maxTentativas})...`);
-      const inicio = Date.now();
 
       const response = await axios({
         method: 'GET',
@@ -64,37 +70,27 @@ async function buscarDetalhesPedido(idOrder, tentativa = 1) {
           'apiKey': API_KEY,
           'Content-Type': 'application/json'
         },
-        timeout: 60000
+        timeout: 30000
       });
 
-      const tempo = Date.now() - inicio;
-
       if (response.data) {
-        console.log(`✅ Pedido JET ${idOrder} obtido em ${tempo / 1000}s`);
+        console.log(`✅ Pedido JET ${idOrder} obtido com sucesso`);
         const dados = response.data.result || response.data;
-        
-        cachePedidos.set(idOrder, { dados: dados, timestamp: Date.now() });
+        cachePedidos.set(idOrder, { dados, timestamp: Date.now() });
         return dados;
       }
 
     } catch (error) {
-      const isTimeout = error.code === 'ECONNABORTED';
       const status = error.response?.status;
-
-      if (isTimeout) {
-        console.log(`⏳ Timeout na tentativa ${tentativaAtual}, aguardando 3s...`);
-        await delay(3000);
-        continue;
+      console.log(`⚠️ Tentativa ${tentativaAtual} falhou: status ${status || error.message}`);
+      
+      if (status === 401) {
+        console.error('❌ Token JET inválido! Verifique JET_API_TOKEN');
+        return null;
       }
-
-      if (status === 404 && tentativaAtual < maxTentativas) {
-        console.log(`⚠️ Pedido JET ${idOrder} não encontrado (404), aguardando e tentando novamente...`);
-        await delay(3000);
-        continue;
-      }
-
-      if (tentativaAtual === maxTentativas) {
-        console.error(`❌ Erro ao buscar pedido JET ${idOrder}:`, isTimeout ? 'Timeout' : (status || error.message));
+      
+      if (tentativaAtual < maxTentativas) {
+        await delay(2000);
       }
     }
   }
@@ -105,7 +101,6 @@ async function buscarDetalhesPedido(idOrder, tentativa = 1) {
 // Extrair informações relevantes
 function extrairInfoRelevante(detalhes) {
   if (!detalhes) return null;
-
   return {
     id: detalhes.idOrder,
     numero_marketplace: detalhes.marketPlaceNumberOrder,
@@ -117,11 +112,10 @@ function extrairInfoRelevante(detalhes) {
 // Processar webhook PRINCIPAL
 async function processWebhook(payload) {
   try {
-    // Aceita diferentes formatos de payload
     const idInterno = payload.Id || payload.id || payload.orderId;
     const numeroPedido = payload.ModifiedId || payload.modifiedId || payload.marketPlaceNumberOrder;
     const event = payload.Event || payload.event || payload.status;
-    const eventOccurredAt = payload.EventOccurredAt || payload.eventOccurredAt || payload.timestamp || new Date().toISOString();
+    const eventOccurredAt = payload.EventOccurredAt || payload.eventOccurredAt || new Date().toISOString();
 
     console.log(`\n${'═'.repeat(60)}`);
     console.log(`📥 WEBHOOK JET RECEBIDO!`);
@@ -129,26 +123,25 @@ async function processWebhook(payload) {
     console.log(`   ID Interno: ${idInterno}`);
     console.log(`   Número Pedido: ${numeroPedido}`);
 
-    // Deduplicação
     const dedupKey = `jet-${idInterno}-${event}`;
     if (isDuplicate(dedupKey)) {
-      console.log(`⏭️ Ignorando duplicata JET: ${idInterno} - ${event}`);
+      console.log(`⏭️ Ignorando duplicata`);
       return { ok: true, dedup: true };
     }
 
     if (!numeroPedido && !idInterno) {
-      console.error(`❌ Webhook JET sem identificador`);
+      console.error(`❌ Webhook sem identificador`);
       return { ok: false, error: 'Sem identificador' };
     }
 
-    const searchId = numeroPedido || idInterno;
+    const searchId = String(numeroPedido || idInterno);
 
-    // Buscar dados completos na API
-    console.log(`🔍 Buscando dados completos do pedido ${searchId} na API...`);
+    // Buscar dados na API
+    console.log(`🔍 Buscando dados do pedido ${searchId} na API...`);
     const jsonCompleto = await buscarDetalhesPedido(searchId);
     
     if (!jsonCompleto) {
-      console.warn(`⚠️ Não conseguiu buscar dados da API JET para ${searchId}`);
+      console.warn(`⚠️ API JET falhou para ${searchId}, salvando em fallback`);
       return await salvarWebhookSemAPI(idInterno, searchId, event, eventOccurredAt, payload);
     }
 
@@ -159,22 +152,19 @@ async function processWebhook(payload) {
       return await salvarWebhookSemAPI(idInterno, searchId, event, eventOccurredAt, payload);
     }
 
-    const numeroMarketplace = infoEssencial.numero_marketplace;
+    const numeroMarketplace = String(infoEssencial.numero_marketplace);
     const normalizedStatus = STATUS_MAP[event] || event;
 
     console.log(`✅ Marketplace ID: ${numeroMarketplace}`);
     console.log(`🏪 Marketplace: ${infoEssencial.marketplace}`);
     console.log(`📊 Status: ${event} → ${normalizedStatus}`);
 
-    // Salvar evento JET
+    // Salvar tracking event
     await pool.query(
       `INSERT INTO tracking_events 
        (id, pedido_id, origem, status, timestamp, payload, dados_completos, criado_em) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-       ON CONFLICT (pedido_id, origem, status) DO UPDATE SET
-         timestamp = EXCLUDED.timestamp,
-         payload = EXCLUDED.payload,
-         dados_completos = EXCLUDED.dados_completos`,
+       ON CONFLICT (pedido_id, origem, status) DO NOTHING`,
       [
         uuidv4(),
         numeroMarketplace,
@@ -188,18 +178,18 @@ async function processWebhook(payload) {
 
     console.log(`✅ JET ${numeroMarketplace} - Evento ${event} salvo`);
 
-    // Salvar/atualizar mapeamento
+    // Salvar mapeamento
     await pool.query(
       `INSERT INTO pedidos_mapeamento 
        (id_jet, numero_marketplace, atualizado_em)
        VALUES ($1, $2, NOW())
        ON CONFLICT (numero_marketplace) DO UPDATE SET
-         id_jet = $1,
+         id_jet = EXCLUDED.id_jet,
          atualizado_em = NOW()`,
       [searchId, numeroMarketplace]
     );
 
-    // Eventos especiais
+    // Evento especial: Em produção
     if (event === 'Pedido.EmProducao') {
       await pool.query(
         `INSERT INTO tracking_events 
@@ -219,6 +209,7 @@ async function processWebhook(payload) {
       console.log(`🏭 [ONCLICK] Pedido ${numeroMarketplace} em produção`);
     }
 
+    // Evento especial: Enviado
     if (event === 'Pedido.Enviado') {
       await pool.query(
         `INSERT INTO tracking_events 
@@ -238,15 +229,14 @@ async function processWebhook(payload) {
       console.log(`↩️ [RETORNO_JET] Pedido ${numeroMarketplace} confirmado`);
     }
 
-    // Log do webhook
+    // Log do webhook - MESMO PADRÃO DO ANYMARKET (usa 1 inteiro)
     await pool.query(
       `INSERT INTO webhook_log (source, event_type, payload, received_at, processed)
        VALUES ($1, $2, $3, $4, $5)`,
-      ['jet', event, JSON.stringify(payload), new Date(), true]
+      ['jet', event, JSON.stringify(payload), new Date(), 1]
     );
 
-    console.log(`✅ Webhook JET processado com sucesso`);
-    
+    console.log(`✅ Webhook JET processado com sucesso!`);
     return { ok: true, numero_marketplace: numeroMarketplace, status: normalizedStatus };
 
   } catch (error) {
@@ -259,6 +249,7 @@ async function processWebhook(payload) {
 async function salvarWebhookSemAPI(idInterno, numeroPedido, event, eventOccurredAt, payload) {
   try {
     const normalizedStatus = STATUS_MAP[event] || event;
+    const pedidoId = String(numeroPedido);
 
     await pool.query(
       `INSERT INTO tracking_events 
@@ -267,22 +258,24 @@ async function salvarWebhookSemAPI(idInterno, numeroPedido, event, eventOccurred
        ON CONFLICT (pedido_id, origem, status) DO NOTHING`,
       [
         uuidv4(),
-        numeroPedido,
+        pedidoId,
         'JET',
         normalizedStatus,
         new Date(eventOccurredAt),
         JSON.stringify(payload),
-        JSON.stringify({ erro: 'Não foi possível buscar dados da API JET' })
+        JSON.stringify({ erro: 'API JET indisponível', webhook: payload })
       ]
     );
 
+    console.log(`✅ JET ${pedidoId} salvo em fallback`);
+
+    // Log do webhook - MESMO PADRÃO DO ANYMARKET (usa 1 inteiro)
     await pool.query(
       `INSERT INTO webhook_log (source, event_type, payload, received_at, processed)
        VALUES ($1, $2, $3, $4, $5)`,
-      ['jet', event, JSON.stringify(payload), new Date(), true]
+      ['jet', event, JSON.stringify(payload), new Date(), 1]
     );
 
-    console.log(`✅ JET ${numeroPedido} salvo em modo fallback`);
     return { ok: true, fallback: true };
   } catch (error) {
     console.error('❌ Erro no fallback:', error.message);

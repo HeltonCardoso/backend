@@ -5,34 +5,6 @@ const anymarketService = require("../services/anymarket.service");
 const jetService = require("../services/jet.service");
 
 // ============================================================
-// JET WEBHOOK - Principal
-// ============================================================
-router.post("/jet", async (req, res) => {
-  const payload = req.body;
-  
-  console.log(`\n${'═'.repeat(60)}`);
-  console.log(`📥 WEBHOOK JET RECEBIDO!`);
-  console.log(`📦 Payload bruto:`, JSON.stringify(payload, null, 2));
-  
-  // ⭐ RESPOSTA IMEDIATA - CRÍTICO PARA RENDER!
-  res.status(200).json({ 
-    success: true, 
-    message: "Webhook recebido, processando em background",
-    timestamp: new Date().toISOString()
-  });
-  
-  // Processamento em background (sem bloquear resposta)
-  setImmediate(async () => {
-    try {
-      const result = await jetService.processWebhook(payload);
-      console.log(`✅ Webhook JET processado:`, result);
-    } catch (err) {
-      console.error(`❌ Erro no processamento JET:`, err.message);
-    }
-  });
-});
-
-// ============================================================
 // ANYMARKET WEBHOOK
 // ============================================================
 router.post("/anymarket", async (req, res) => {
@@ -42,7 +14,7 @@ router.post("/anymarket", async (req, res) => {
   console.log(`📥 WEBHOOK ANYMARKET RECEBIDO!`);
   console.log(`📦 Evento: ${payload.type || payload.situationCode || "desconhecido"}`);
   
-  // Resposta imediata
+  // Resposta imediata (evita timeout no Render)
   res.status(200).json({ 
     success: true, 
     message: "Webhook recebido, processando em background",
@@ -53,9 +25,37 @@ router.post("/anymarket", async (req, res) => {
   setImmediate(async () => {
     try {
       const result = await anymarketService.processWebhook(payload);
-      console.log(`✅ Webhook AnyMarket processado:`, result?.ok ? "OK" : "ERRO");
+      console.log(`✅ Webhook AnyMarket processado: ${result?.ok ? "OK" : "ERRO"}`);
     } catch (err) {
       console.error(`❌ Erro no processamento AnyMarket:`, err.message);
+    }
+  });
+});
+
+// ============================================================
+// JET WEBHOOK
+// ============================================================
+router.post("/jet", async (req, res) => {
+  const payload = req.body;
+  
+  console.log(`\n${'═'.repeat(60)}`);
+  console.log(`📥 WEBHOOK JET RECEBIDO!`);
+  console.log(`📦 Payload bruto:`, JSON.stringify(payload, null, 2));
+  
+  // Resposta imediata (evita timeout no Render)
+  res.status(200).json({ 
+    success: true, 
+    message: "Webhook recebido, processando em background",
+    timestamp: new Date().toISOString()
+  });
+  
+  // Processamento em background
+  setImmediate(async () => {
+    try {
+      const result = await jetService.processWebhook(payload);
+      console.log(`✅ Webhook JET processado:`, result);
+    } catch (err) {
+      console.error(`❌ Erro no processamento JET:`, err.message);
     }
   });
 });
@@ -69,11 +69,14 @@ router.post("/onclick", async (req, res) => {
   console.log(`\n${'═'.repeat(60)}`);
   console.log(`📥 WEBHOOK ONCLICK RECEBIDO!`);
   
-  res.status(200).json({ success: true, message: "Webhook recebido" });
+  res.status(200).json({ 
+    success: true, 
+    message: "Webhook recebido",
+    timestamp: new Date().toISOString()
+  });
   
   setImmediate(async () => {
     try {
-      // Processar ONCLICK se tiver lógica
       console.log(`✅ Webhook OnClick registrado`);
     } catch (err) {
       console.error(`❌ Erro:`, err.message);
@@ -82,10 +85,9 @@ router.post("/onclick", async (req, res) => {
 });
 
 // ============================================================
-// ENDPOINTS DE TESTE E DIAGNÓSTICO
+// ENDPOINTS DE TESTE
 // ============================================================
 
-// Teste simples - verifica se o endpoint está vivo
 router.get("/jet/test", (req, res) => {
   res.json({ 
     status: "online", 
@@ -102,20 +104,10 @@ router.get("/jet/test", (req, res) => {
   });
 });
 
-// Status geral do serviço
-router.get("/status", async (req, res) => {
-  let dbStatus = "unknown";
-  try {
-    const result = await pool.query("SELECT 1");
-    dbStatus = result.rows ? "connected" : "error";
-  } catch (e) {
-    dbStatus = "disconnected";
-  }
-  
+router.get("/status", (req, res) => {
   res.json({
     service: "webhook-receiver",
     status: "running",
-    database: dbStatus,
     jet_api_token: process.env.JET_API_TOKEN ? "configured" : "missing",
     timestamp: new Date().toISOString()
   });

@@ -3,38 +3,278 @@ const axios = require("axios");
 const { v4: uuidv4 } = require('uuid');
 const pool = require("../../config/database");
 
+const API_KEY = process.env.ANYMARKET_TOKEN;
 const BASE_URL = process.env.ANYMARKET_BASE_URL || "https://api.anymarket.com.br/v2";
-const TOKEN = process.env.ANYMARKET_TOKEN;
 
-const api = axios.create({
-  baseURL: BASE_URL,
-  headers: {
-    "gumgaToken": TOKEN,
-    "Content-Type": "application/json",
-  },
-  timeout: 15000,
-});
+// ──────────────────────────────────────────────────────────────────────────────
+// 1. MAPEAMENTO DE STATUS (igual ao antigo)
+// ──────────────────────────────────────────────────────────────────────────────
+const STATUS_MAP = {
+  'ORDER': 'PENDENTE',
+  'PAID_WAITING_SHIP': 'PAGO_AGUARDANDO_ENVIO',
+  'PAID_WAITING_DELIVERY': 'PAGO_AGUARDANDO_ENTREGA',
+  'INVOICED': 'FATURADO',
+  'SHIPPED': 'ENVIADO',
+  'DELIVERED': 'ENTREGUE',
+  'CONCLUDED': 'CONCLUIDO',
+  'CANCELED': 'CANCELADO',
+  'APPROVED': 'APROVADO',
+  'WAITING_PAYMENT': 'AGUARDANDO_PAGAMENTO',
+  'PAYMENT_ANALYSIS': 'ANALISE_PAGAMENTO',
+  'PAYMENT_REPROVED': 'PAGAMENTO_REPROVADO'
+};
 
-// Mapeamento de status ANYMARKET → status interno
-function mapStatus(anymarketStatus) {
-  const map = {
-    "APPROVED": "APROVADO",
-    "INVOICED": "FATURADO",
-    "SHIPPED": "ENVIADO",
-    "DELIVERED": "ENTREGUE",
-    "CONCLUDED": "CONCLUIDO",
-    "CANCELED": "CANCELADO",
-    "WAITING_PAYMENT": "AGUARDANDO_PAGAMENTO",
-    "PAYMENT_ANALYSIS": "ANALISE_PAGAMENTO",
-    "PAID_WAITING_SHIP": "PAGO_AGUARDANDO_ENVIO",
-    "PAID_WAITING_DELIVERY": "PAGO_AGUARDANDO_ENTREGA",
-    "PENDING": "PENDENTE",
-    "PAYMENT_REPROVED": "PAGAMENTO_REPROVADO"
-  };
-  return map[anymarketStatus] || anymarketStatus;
+// ──────────────────────────────────────────────────────────────────────────────
+// 2. CACHE DE DEDUPLICAÇÃO (evita processar o mesmo webhook duas vezes)
+// ──────────────────────────────────────────────────────────────────────────────
+const recentlyProcessed = new Map();
+
+const isDuplicate = (key) => {
+  const last = recentlyProcessed.get(key);
+  if (last && Date.now() - last < 30000) return true; // 30 segundos
+  recentlyProcessed.set(key, Date.now());
+  return false;
+};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 3. BUSCAR DADOS COMPLETOS NA API DO ANYMARKET
+// ──────────────────────────────────────────────────────────────────────────────
+async function buscarDetalhesPedido(pedidoId) {
+  try {
+    console.log(`🔍 Consultando AnyMarket API: ${pedidoId}`);
+    
+    const response = await axios.get(`${BASE_URL}/orders/${pedidoId}`, {
+      headers: {
+        'Content-Type': 'application/json',
+        'gumgaToken': API_KEY
+      },
+      timeout: 60000
+    });
+
+    if (response.data) {
+      console.log(`✅ Pedido AnyMarket ${pedidoId} encontrado`);
+      return response.data;
+    }
+    return null;
+  } catch (error) {
+    console.error(`❌ Erro ao buscar pedido AnyMarket ${pedidoId}:`, error.response?.status, error.message);
+    return null;
+  }
 }
 
-// Buscar pedidos da API AnyMarket
+// ──────────────────────────────────────────────────────────────────────────────
+// 4. EXTRAIR INFORMAÇÕES RELEVANTES (numero_marketplace, marketplace, ME2)
+// ──────────────────────────────────────────────────────────────────────────────
+function extrairInfoRelevante(dados) {
+  if (!dados) return null;
+
+  try {
+    return {
+      // IDs - ESSENCIAIS PARA O SISTEMA
+      id_anymarket: dados.id,
+      numero_marketplace: dados.marketPlaceId,
+      marketplace_number: dados.marketPlaceNumber || dados.marketPlaceId,
+      marketplace: dados.marketPlace,
+      
+      // Status
+      status: dados.status || 'DESCONHECIDO',
+      status_marketplace: dados.marketPlaceStatus || 'DESCONHECIDO',
+      
+      // ME2 detection (Mercado Livre - usado para evitar falsas anomalias)
+      produtos: (dados.items || []).map(item => ({
+        shippingtype: item.shippings?.[0]?.shippingtype || ''
+      }))
+    };
+  } catch (error) {
+    console.error('❌ Erro ao extrair info AnyMarket:', error.message);
+    return null;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 5. FUNÇÃO PRINCIPAL - PROCESSAR WEBHOOK (IGUAL AO SISTEMA ANTIGO)
+// ──────────────────────────────────────────────────────────────────────────────
+async function processWebhook(payload) {
+  try {
+    const { content, event } = payload;
+    const idAnyMarket = content?.id;
+
+    console.log(`\n${'═'.repeat(60)}`);
+    console.log(`📥 WEBHOOK ANYMARKET RECEBIDO!`);
+    console.log(`   Evento: ${event}`);
+    console.log(`   ID AnyMarket: ${idAnyMarket}`);
+
+    // ─── DEDUPLICAÇÃO ────────────────────────────────────────────────────────
+    const dedupKey = `anymarket-${idAnyMarket}-${event}`;
+    if (isDuplicate(dedupKey)) {
+      console.log(`⏭️ Ignorando duplicata AnyMarket: ${idAnyMarket} - ${event}`);
+      return { ok: true, dedup: true };
+    }
+
+    if (!idAnyMarket) {
+      console.error(`❌ Webhook AnyMarket sem content.id`);
+      return { ok: false, error: 'Webhook sem orderId' };
+    }
+
+    // ─── 1️⃣ BUSCAR DADOS COMPLETOS NA API ───────────────────────────────────
+    console.log(`🔍 Buscando dados completos do pedido ${idAnyMarket} na API...`);
+    const jsonCompleto = await buscarDetalhesPedido(idAnyMarket);
+    
+    if (!jsonCompleto) {
+      console.warn(`⚠️ Não conseguiu buscar dados da API AnyMarket ${idAnyMarket}`);
+      return { ok: false, error: 'Falha ao buscar dados da API' };
+    }
+
+    // ─── 2️⃣ EXTRAIR APENAS O NECESSÁRIO ──────────────────────────────────────
+    const infoEssencial = extrairInfoRelevante(jsonCompleto);
+
+    if (!infoEssencial || !infoEssencial.numero_marketplace) {
+      console.error(`❌ Não conseguiu extrair numero_marketplace do pedido AnyMarket ${idAnyMarket}`);
+      return { ok: false, error: 'Não foi possível extrair numero_marketplace' };
+    }
+
+    const numeroMarketplace = infoEssencial.numero_marketplace;
+
+    console.log(`✅ Marketplace ID obtido: ${numeroMarketplace}`);
+    console.log(`🏪 Marketplace: ${infoEssencial.marketplace}`);
+    console.log(`📊 Status: ${event} → ${STATUS_MAP[event] || event}`);
+
+    // ─── 3️⃣ SALVAR MAPEAMENTO ───────────────────────────────────────────────
+    await pool.query(
+      `INSERT INTO pedidos_mapeamento 
+       (id_anymarket, numero_marketplace, marketplace_origem, criado_em, atualizado_em)
+       VALUES ($1, $2, $3, NOW(), NOW())
+       ON CONFLICT (numero_marketplace) DO UPDATE SET
+         id_anymarket = $1,
+         marketplace_origem = $3,
+         atualizado_em = NOW()`,
+      [idAnyMarket, numeroMarketplace, infoEssencial.marketplace]
+    );
+
+    // ─── 4️⃣ NORMALIZAR STATUS ───────────────────────────────────────────────
+    const normalizedStatus = STATUS_MAP[event] || event;
+
+    // ─── 5️⃣ SALVAR TRACKING (com JSON COMPLETO!) ─────────────────────────────
+    await pool.query(
+      `INSERT INTO tracking_events 
+       (id, pedido_id, origem, status, timestamp, payload, dados_completos, criado_em) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       ON CONFLICT (pedido_id, origem, status) DO UPDATE SET
+         timestamp = EXCLUDED.timestamp,
+         payload = EXCLUDED.payload,
+         dados_completos = EXCLUDED.dados_completos`,
+      [
+        uuidv4(),
+        numeroMarketplace,
+        'ANYMARKET',
+        normalizedStatus,
+        new Date(),
+        JSON.stringify(payload),
+        JSON.stringify(jsonCompleto)  // ✅ JSON COMPLETO DA API!
+      ]
+    );
+
+    console.log(`✅ ANYMARKET ${numeroMarketplace} salvo com status ${normalizedStatus}`);
+
+    // ─── 6️⃣ PAID_WAITING_DELIVERY = AnyMarket confirmou envio ─────────────────
+    if (event === 'PAID_WAITING_DELIVERY') {
+      await pool.query(
+        `INSERT INTO tracking_events 
+         (id, pedido_id, origem, status, timestamp, payload, dados_completos, criado_em) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+         ON CONFLICT (pedido_id, origem, status) DO UPDATE SET
+           timestamp = EXCLUDED.timestamp,
+           payload = EXCLUDED.payload`,
+        [
+          uuidv4(),
+          numeroMarketplace,
+          'RETORNO_ANYMARKET',
+          'ENVIADO',
+          new Date(),
+          JSON.stringify(payload),
+          JSON.stringify(jsonCompleto)
+        ]
+      );
+      console.log(`↩️ [RETORNO_ANYMARKET] Pedido ${numeroMarketplace} confirmado como enviado`);
+    }
+
+    // ─── 7️⃣ VERIFICAR ANOMALIA: FATURADO_APOS_ENVIO (exceto ME2) ──────────────
+    if (event === 'INVOICED') {
+      const jetEnviado = await pool.query(
+        `SELECT id FROM tracking_events 
+         WHERE pedido_id = $1 AND origem = 'JET' AND status = 'ENVIADO' LIMIT 1`,
+        [numeroMarketplace]
+      );
+
+      if (jetEnviado.rows.length) {
+        // Verificar se é ME2 (Mercado Livre coleta normal)
+        const pedidoIsMe2 = infoEssencial.produtos?.some(item =>
+          (item.shippingtype || '').toLowerCase().includes('me2')
+        );
+        
+        if (!pedidoIsMe2) {
+          console.warn(`⚠️ Pedido ${numeroMarketplace} ficou FATURADO após JET enviar (não é ME2)`);
+          
+          // Criar anomalia
+          await pool.query(
+            `INSERT INTO anomalias 
+             (id, pedido_id, tipo, origem_falha, marketplace, detalhes, criado_em, resolvida)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), false)
+             ON CONFLICT (pedido_id, tipo) DO NOTHING`,
+            [
+              uuidv4(),
+              numeroMarketplace,
+              'FATURADO_APOS_ENVIO',
+              'ANYMARKET',
+              infoEssencial.marketplace,
+              JSON.stringify({ detalhes: 'AnyMarket ficou como Faturado após JET já ter confirmado envio' })
+            ]
+          );
+        } else {
+          console.log(`ℹ️ Pedido ${numeroMarketplace} ME2 - aguardando bipagem da etiqueta`);
+        }
+      }
+    }
+
+    // ─── 8️⃣ REGISTRAR LOG DO WEBHOOK ─────────────────────────────────────────
+    await pool.query(
+      `INSERT INTO webhook_log (source, event_type, payload, received_at, processed)
+       VALUES ($1, $2, $3, $4, $5)`,
+      ['anymarket', event, JSON.stringify(payload), new Date(), true]
+    );
+
+    console.log(`✅ Webhook AnyMarket ${idAnyMarket} processado com sucesso`);
+    
+    // Retornar resultado
+    return { 
+      ok: true, 
+      orderId: idAnyMarket, 
+      numero_marketplace: numeroMarketplace,
+      status: normalizedStatus,
+      marketplace: infoEssencial.marketplace
+    };
+
+  } catch (error) {
+    console.error('❌ Erro ao processar AnyMarket:', error.message);
+    
+    // Registrar erro no log
+    try {
+      await pool.query(
+        `INSERT INTO webhook_log (source, event_type, payload, received_at, processed, error)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        ['anymarket', payload?.event || 'unknown', JSON.stringify(payload), new Date(), false, error.message]
+      );
+    } catch (logErr) {
+      console.error('❌ Erro ao logar:', logErr.message);
+    }
+    
+    return { ok: false, error: error.message };
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 6. FUNÇÃO PARA BUSCAR PEDIDOS (polling/backfill)
+// ──────────────────────────────────────────────────────────────────────────────
 async function fetchOrders(params) {
   if (params.limit && params.limit < 5) {
     params.limit = 5;
@@ -43,9 +283,16 @@ async function fetchOrders(params) {
   console.log(`[AnyMarket API] Buscando pedidos com:`, params);
   
   try {
-    const response = await api.get('/orders', { params });
-    const orders = response.data?.content || [];
+    const response = await axios.get(`${BASE_URL}/orders`, {
+      headers: {
+        "gumgaToken": API_KEY,
+        "Content-Type": "application/json",
+      },
+      params,
+      timeout: 15000
+    });
     
+    const orders = response.data?.content || [];
     console.log(`[AnyMarket API] Resposta: ${orders.length} pedidos encontrados`);
     return orders;
   } catch (error) {
@@ -54,244 +301,45 @@ async function fetchOrders(params) {
   }
 }
 
-// CORRIGIDO: Salvar/atualizar pedido usando PostgreSQL
-async function upsertOrder(o) {
-  const anymarketId = String(o.id);
-  
-  // 🔥 CORREÇÃO CRUCIAL: NÃO usar o.oi como fallback!
-  // O .oi é código interno da AnyMarket, não é o número do pedido no marketplace
-  const numeroMarketplace = String(o.marketPlaceId || o.marketplaceOrderId || "");
-  
-  const createdAt = o.createdAt || o.created_at || new Date().toISOString();
-  const currentStatus = mapStatus(o.status || o.situationCode);
-  
-  const marketplaceOrigem = o.marketPlace || o.marketplaceName || null;
-  const loja = o.accountName || null;
-  const marketplaceCanal = o.marketPlace || o.marketplaceName || null;
-
-  // Validação: se não tem numero_marketplace, NÃO SALVAR
-  if (!numeroMarketplace || numeroMarketplace === "undefined" || numeroMarketplace === "") {
-    console.error(`[Upsert] ⚠️ Pedido ${anymarketId} ignorado - sem marketPlaceId! Oi recebido: ${o.oi}`);
-    return { 
-      action: 'ignored', 
-      error: 'sem_marketplace_id',
-      anymarketId,
-      oi_recebido: o.oi 
-    };
-  }
-
-  console.log(`[Upsert] Processando: AnyMarket=${anymarketId} | Marketplace=${numeroMarketplace} | Status=${currentStatus}`);
-
-  try {
-    // Verificar se o pedido já existe
-    const existing = await pool.query(
-      `SELECT id, id_anymarket, numero_marketplace 
-       FROM pedidos_mapeamento 
-       WHERE numero_marketplace = $1 OR id_anymarket = $2`,
-      [numeroMarketplace, anymarketId]
-    );
-
-    if (existing.rows.length > 0) {
-      // Buscar último status
-      const lastEvent = await pool.query(
-        `SELECT status FROM tracking_events 
-         WHERE pedido_id = $1 ORDER BY timestamp DESC LIMIT 1`,
-        [numeroMarketplace]
-      );
-      
-      const lastStatus = lastEvent.rows[0]?.status;
-      const statusChanged = lastStatus !== currentStatus;
-      
-      // Atualizar pedido
-      await pool.query(`
-        UPDATE pedidos_mapeamento 
-        SET id_anymarket = $1, 
-            marketplace_origem = $2,
-            loja = $3,
-            marketplace_canal = $4,
-            atualizado_em = NOW()
-        WHERE numero_marketplace = $5
-      `, [anymarketId, marketplaceOrigem, loja, marketplaceCanal, numeroMarketplace]);
-      
-      if (statusChanged) {
-        await pool.query(`
-          INSERT INTO tracking_events (
-            id, pedido_id, origem, status, timestamp, payload, criado_em, dados_completos
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
-          ON CONFLICT (pedido_id, origem, status) 
-          DO UPDATE SET 
-            timestamp = EXCLUDED.timestamp,
-            payload = EXCLUDED.payload,
-            criado_em = NOW()
-        `, [
-          uuidv4(), 
-          numeroMarketplace, 
-          'ANYMARKET', 
-          currentStatus, 
-          createdAt, 
-          JSON.stringify({ 
-            event: 'status_changed', 
-            old_status: lastStatus, 
-            new_status: currentStatus 
-          }),
-          JSON.stringify(o)
-        ]);
-        
-        console.log(`[Upsert] ✅ Pedido ${anymarketId}: ${lastStatus} → ${currentStatus}`);
-      } else {
-        console.log(`[Upsert] 📝 Pedido ${anymarketId} atualizado (mesmo status)`);
-      }
-      
-      return { action: 'updated', numero_marketplace: numeroMarketplace };
-      
-    } else {
-      // NOVO PEDIDO
-      await pool.query(`
-        INSERT INTO pedidos_mapeamento (
-          id_anymarket, 
-          numero_marketplace, 
-          marketplace_origem, 
-          loja, 
-          marketplace_canal, 
-          criado_em, 
-          atualizado_em
-        )
-        VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-      `, [anymarketId, numeroMarketplace, marketplaceOrigem, loja, marketplaceCanal]);
-      
-      await pool.query(`
-        INSERT INTO tracking_events (
-          id, pedido_id, origem, status, timestamp, payload, criado_em, dados_completos
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
-        ON CONFLICT (pedido_id, origem, status) DO NOTHING
-      `, [
-        uuidv4(), 
-        numeroMarketplace, 
-        'ANYMARKET', 
-        currentStatus, 
-        createdAt, 
-        JSON.stringify({ 
-          event: 'pedido_criado' 
-        }),
-        JSON.stringify(o)
-      ]);
-      
-      console.log(`[Upsert] 🆕 Pedido ${anymarketId} INSERIDO | Marketplace: ${numeroMarketplace}`);
-      return { action: 'inserted', numero_marketplace: numeroMarketplace };
-    }
-  } catch (err) {
-    console.error(`[Upsert] ❌ Erro no pedido ${anymarketId}:`, err.message);
-    throw err;
-  }
-}
-
-// CORRIGIDO: Processar webhook
-async function processWebhook(payload) {
-  const now = new Date().toISOString();
-
-  try {
-    // Função para extrair o pedido de qualquer formato
-    function extractOrder(data) {
-      // Caso 1: { content: { id, ... } }
-      if (data.content?.id) return data.content;
-      
-      // Caso 2: { data: { id, ... } }
-      if (data.data?.id) return data.data;
-      
-      // Caso 3: { id, ... } direto
-      if (data.id) return data;
-      
-      // Caso 4: array com um pedido
-      if (Array.isArray(data) && data[0]?.id) return data[0];
-      
-      return data;
-    }
-    
-    const rawOrder = extractOrder(payload);
-    const orderId = rawOrder.id;
-    
-    if (!orderId) {
-      console.error('[Webhook] Não foi possível extrair orderId do payload:', 
-        JSON.stringify(payload).substring(0, 300));
-      return { ok: false, error: 'Webhook sem orderId' };
-    }
-
-    // Mapeamento de eventos para status
-    const statusMap = {
-      'ORDER': 'PENDENTE',
-      'PAID_WAITING_SHIP': 'PAGO_AGUARDANDO_ENVIO',
-      'PAID_WAITING_DELIVERY': 'PAGO_AGUARDANDO_ENTREGA',
-      'INVOICED': 'FATURADO',
-      'SHIPPED': 'ENVIADO',
-      'DELIVERED': 'ENTREGUE',
-      'CANCELED': 'CANCELADO',
-      'APPROVED': 'APROVADO',
-      'WAITING_PAYMENT': 'AGUARDANDO_PAGAMENTO'
-    };
-    
-    // Determinar o status
-    const eventType = payload.event || payload.type;
-    const orderStatus = rawOrder.status || rawOrder.situationCode;
-    const currentStatus = statusMap[eventType] || statusMap[orderStatus] || mapStatus(orderStatus) || 'DESCONHECIDO';
-    
-    // Montar objeto padronizado para o upsertOrder
-    const orderForUpsert = {
-      id: orderId,
-      marketPlaceId: rawOrder.marketPlaceId || rawOrder.marketplaceOrderId || rawOrder.marketPlaceNumber,
-      marketPlace: rawOrder.marketPlace || rawOrder.marketplaceName || payload.marketplaceName,
-      status: currentStatus,
-      situationCode: payload.event || orderStatus,
-      createdAt: rawOrder.createdAt || rawOrder.created_at || rawOrder.orderDate || now,
-      accountName: rawOrder.accountName,
-      total: rawOrder.total || rawOrder.totalAmount
-    };
-    
-    console.log(`[Webhook] 🚚 Pedido ${orderId} | Status: ${currentStatus} | Evento: ${payload.event || payload.type}`);
-
-    // Registrar log do webhook
-    const logResult = await pool.query(`
-      INSERT INTO webhook_log (source, event_type, payload, received_at)
-      VALUES ($1, $2, $3, $4)
-      RETURNING id
-    `, ['anymarket', payload.event || payload.type || "unknown", JSON.stringify(payload), now]);
-
-    const logId = logResult.rows[0].id;
-
-    // Processar o pedido
-    const result = await upsertOrder(orderForUpsert);
-
-    // Marcar como processado
-    await pool.query(`UPDATE webhook_log SET processed = 1 WHERE id = $1`, [logId]);
-    
-    console.log(`[Webhook] ✅ Pedido ${orderId} processado com sucesso`);
-    return { ok: true, orderId, result };
-    
-  } catch (err) {
-    console.error(`[Webhook] ❌ Erro:`, err.message);
-    return { ok: false, error: err.message };
-  }
-}
-
-// Sincronizar pedidos (buscar da API)
+// ──────────────────────────────────────────────────────────────────────────────
+// 7. SINCRONIZAR PEDIDOS (buscar da API e salvar)
+// ──────────────────────────────────────────────────────────────────────────────
 async function syncOrders(since) {
   const sinceDate = since || new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
   const orders = await fetchOrders({ since: sinceDate, limit: 50 });
   let upserted = 0;
 
   for (const o of orders) {
-    await upsertOrder(o);
-    upserted++;
+    // Para cada pedido, busca os detalhes completos e salva
+    const jsonCompleto = await buscarDetalhesPedido(o.id);
+    if (jsonCompleto) {
+      const infoEssencial = extrairInfoRelevante(jsonCompleto);
+      if (infoEssencial?.numero_marketplace) {
+        await pool.query(
+          `INSERT INTO pedidos_mapeamento 
+           (id_anymarket, numero_marketplace, marketplace_origem, criado_em, atualizado_em)
+           VALUES ($1, $2, $3, NOW(), NOW())
+           ON CONFLICT (numero_marketplace) DO UPDATE SET
+             id_anymarket = $1,
+             atualizado_em = NOW()`,
+          [o.id, infoEssencial.numero_marketplace, infoEssencial.marketplace]
+        );
+        upserted++;
+      }
+    }
   }
 
   console.log(`[Anymarket] Sincronizados ${upserted} pedidos`);
   return upserted;
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// EXPORTS
+// ──────────────────────────────────────────────────────────────────────────────
 module.exports = { 
-  fetchOrders, 
   processWebhook,
-  upsertOrder,
+  buscarDetalhesPedido,
+  extrairInfoRelevante,
+  fetchOrders,
   syncOrders
 };

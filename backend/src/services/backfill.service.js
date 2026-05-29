@@ -215,7 +215,7 @@ async function upsertOrder(o) {
   );
 
   if (existing.rows.length > 0) {
-    // ATUALIZAR pedido existente com campos que podem estar faltando
+    // ATUALIZAR pedido existente
     await db.query(`
       UPDATE pedidos_mapeamento 
       SET id_anymarket = $1, 
@@ -268,7 +268,7 @@ async function upsertOrder(o) {
 }
 
 // ============================================================
-// BACKFILL JET - Buscar dados faltantes da JET e CRIAR EVENTOS
+// BACKFILL JET - ENRIQUECER PEDIDOS QUE JÁ TÊM ID_JET
 // ============================================================
 async function backfillJet({ onProgress } = {}) {
   if (currentRun && currentRun.status === "running") {
@@ -285,23 +285,26 @@ async function backfillJet({ onProgress } = {}) {
     skipped: 0
   };
 
-  console.log(`[Backfill JET] Iniciando busca de pedidos sem id_jet...`);
+  console.log(`[Backfill JET] Iniciando enriquecimento de pedidos com id_jet...`);
 
   try {
+    // Buscar pedidos que JÁ TÊM id_jet, mas faltam dados (delivery_time_jet vazio)
     const { rows: pedidos } = await db.query(`
       SELECT 
         numero_marketplace, 
-        id_anymarket,
-        marketplace_origem
+        id_jet,
+        marketplace_origem,
+        delivery_time_jet
       FROM pedidos_mapeamento 
-      WHERE (id_jet IS NULL OR id_jet = '')
-        AND id_anymarket IS NOT NULL
+      WHERE id_jet IS NOT NULL 
+        AND id_jet != ''
+        AND (delivery_time_jet IS NULL OR delivery_time_jet = 0)
       ORDER BY criado_em DESC
       LIMIT 500
     `);
 
     currentRun.total = pedidos.length;
-    console.log(`[Backfill JET] Encontrados ${pedidos.length} pedidos para processar`);
+    console.log(`[Backfill JET] Encontrados ${pedidos.length} pedidos para enriquecer`);
 
     if (onProgress) {
       onProgress({ type: 'start', total: pedidos.length });
@@ -311,100 +314,101 @@ async function backfillJet({ onProgress } = {}) {
       const pedido = pedidos[i];
       
       try {
-        console.log(`[Backfill JET] Processando ${i+1}/${pedidos.length}: ${pedido.numero_marketplace}`);
+        console.log(`[Backfill JET] Processando ${i+1}/${pedidos.length}: ${pedido.numero_marketplace} (id_jet: ${pedido.id_jet})`);
         
-        const anymarketData = await anymarketService.buscarDetalhesPedido(pedido.id_anymarket);
+        // Buscar dados completos na API da JET usando o id_jet que já temos
+        const jetData = await jetService.buscarDetalhesPedido(pedido.id_jet);
         
-        if (anymarketData) {
-          const marketPlaceNumber = anymarketData.marketPlaceNumber || anymarketData.marketPlaceId;
+        if (jetData) {
+          // Extrair dados do JSON
+          const deliveryTime = jetData.deliveryTime || 0;
+          const prazoPreparacaoHoras = deliveryTime === 0 ? 24 : deliveryTime * 24;
           
-          if (marketPlaceNumber) {
-            const jetData = await jetService.buscarDetalhesPedido(marketPlaceNumber);
+          // Atualizar pedido_mapeamento com deliveryTime e prazo
+          await db.query(`
+            UPDATE pedidos_mapeamento 
+            SET delivery_time_jet = $1,
+                prazo_preparacao_horas = $2,
+                atualizado_em = NOW()
+            WHERE numero_marketplace = $3
+          `, [deliveryTime, prazoPreparacaoHoras, pedido.numero_marketplace]);
+          
+          currentRun.updated++;
+          
+          // Verificar se já existem eventos JET para este pedido
+          const eventosExistentes = await db.query(`
+            SELECT id FROM tracking_events 
+            WHERE pedido_id = $1 AND origem = 'JET'
+            LIMIT 1
+          `, [pedido.numero_marketplace]);
+          
+          // Criar eventos históricos se não existirem
+          if (eventosExistentes.rows.length === 0) {
+            const history = jetData.historyListOrderStatus || [];
+            let eventosCriados = 0;
             
-            if (jetData) {
-              const infoJet = jetService.extrairInfoRelevante(jetData);
+            // Percorrer histórico de status da JET
+            for (const statusHistory of history) {
+              const statusCode = statusHistory.statusCode;
+              const dateRegister = statusHistory.dateRegisterStatus;
               
-              if (infoJet && infoJet.id) {
-                const deliveryTime = jetData.deliveryTime || 0;
-                const prazoPreparacaoHoras = deliveryTime === 0 ? 24 : deliveryTime * 24;
-                
-                // Atualizar pedido_mapeamento
+              let statusName = 'DESCONHECIDO';
+              if (statusCode === '01') statusName = 'INTEGRADO';
+              if (statusCode === '04') statusName = 'PROCESSANDO';
+              if (statusCode === '07') statusName = 'EM_PRODUCAO';
+              if (statusCode === '05') statusName = 'PRONTO';
+              
+              if (statusName !== 'DESCONHECIDO' && dateRegister) {
                 await db.query(`
-                  UPDATE pedidos_mapeamento 
-                  SET id_jet = $1,
-                      delivery_time_jet = $2,
-                      prazo_preparacao_horas = $3,
-                      atualizado_em = NOW()
-                  WHERE numero_marketplace = $4
-                `, [infoJet.id, deliveryTime, prazoPreparacaoHoras, pedido.numero_marketplace]);
-                
-                currentRun.updated++;
-                
-                // Criar evento JET
-                const history = jetData.historyListOrderStatus || [];
-                let eventosCriados = 0;
-                
-                for (const statusHistory of history) {
-                  const statusCode = statusHistory.statusCode;
-                  const dateRegister = statusHistory.dateRegisterStatus;
-                  
-                  let statusName = 'DESCONHECIDO';
-                  if (statusCode === '01') statusName = 'INTEGRADO';
-                  if (statusCode === '04') statusName = 'PROCESSANDO';
-                  if (statusCode === '07') statusName = 'EM_PRODUCAO';
-                  if (statusCode === '05') statusName = 'PRONTO';
-                  
-                  if (statusName !== 'DESCONHECIDO') {
-                    const result = await db.query(`
-                      INSERT INTO tracking_events 
-                      (id, pedido_id, origem, status, timestamp, dados_completos, criado_em)
-                      VALUES ($1, $2, $3, $4, $5, $6, NOW())
-                      ON CONFLICT (pedido_id, origem, status) DO NOTHING
-                    `, [
-                      uuidv4(),
-                      pedido.numero_marketplace,
-                      'JET',
-                      statusName,
-                      new Date(dateRegister),
-                      JSON.stringify(jetData)
-                    ]);
-                    if (result.rowCount > 0) eventosCriados++;
-                  }
-                }
-                
-                // Se não criou nenhum evento, cria pelo menos um básico
-                if (eventosCriados === 0) {
-                  await db.query(`
-                    INSERT INTO tracking_events 
-                    (id, pedido_id, origem, status, timestamp, dados_completos, criado_em)
-                    VALUES ($1, $2, $3, $4, $5, $6, NOW())
-                    ON CONFLICT (pedido_id, origem, status) DO NOTHING
-                  `, [
-                    uuidv4(),
-                    pedido.numero_marketplace,
-                    'JET',
-                    'INTEGRADO',
-                    new Date(jetData.dateOrder || jetData.marketPlaceDateCreated),
-                    JSON.stringify(jetData)
-                  ]);
-                  eventosCriados = 1;
-                }
-                
-                currentRun.events_created += eventosCriados;
-                console.log(`[Backfill JET] ✅ Atualizado: ${pedido.numero_marketplace} -> id_jet: ${infoJet.id} (${eventosCriados} eventos)`);
-              } else {
-                currentRun.skipped++;
+                  INSERT INTO tracking_events 
+                  (id, pedido_id, origem, status, timestamp, dados_completos, criado_em)
+                  VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                  ON CONFLICT (pedido_id, origem, status) DO NOTHING
+                `, [
+                  uuidv4(),
+                  pedido.numero_marketplace,
+                  'JET',
+                  statusName,
+                  new Date(dateRegister),
+                  JSON.stringify(jetData)
+                ]);
+                eventosCriados++;
               }
-            } else {
-              currentRun.errors++;
             }
+            
+            // Se não criou nenhum evento, cria pelo menos um básico
+            if (eventosCriados === 0) {
+              const dataCriacao = jetData.dateOrder || jetData.marketPlaceDateCreated;
+              if (dataCriacao) {
+                await db.query(`
+                  INSERT INTO tracking_events 
+                  (id, pedido_id, origem, status, timestamp, dados_completos, criado_em)
+                  VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                  ON CONFLICT (pedido_id, origem, status) DO NOTHING
+                `, [
+                  uuidv4(),
+                  pedido.numero_marketplace,
+                  'JET',
+                  'INTEGRADO',
+                  new Date(dataCriacao),
+                  JSON.stringify(jetData)
+                ]);
+                eventosCriados = 1;
+              }
+            }
+            
+            currentRun.events_created += eventosCriados;
+            console.log(`[Backfill JET] ✅ Criados ${eventosCriados} eventos para ${pedido.numero_marketplace} (deliveryTime: ${deliveryTime} dias)`);
           } else {
-            currentRun.skipped++;
+            console.log(`[Backfill JET] ✅ Já existem eventos para ${pedido.numero_marketplace}, apenas atualizado deliveryTime: ${deliveryTime} dias`);
           }
+          
         } else {
           currentRun.errors++;
+          console.log(`[Backfill JET] ❌ Não foi possível buscar dados da JET para id_jet: ${pedido.id_jet}`);
         }
         
+        // Progresso a cada 10 pedidos
         if ((i + 1) % 10 === 0 && onProgress) {
           onProgress({
             type: 'progress',
@@ -417,18 +421,18 @@ async function backfillJet({ onProgress } = {}) {
           });
         }
         
-        await sleep(500);
+        await sleep(500); // Delay para não sobrecarregar a API
         
       } catch (error) {
         currentRun.errors++;
-        console.error(`[Backfill JET] Erro:`, error.message);
+        console.error(`[Backfill JET] Erro no pedido ${pedido.numero_marketplace}:`, error.message);
       }
     }
 
     currentRun.status = "done";
-    console.log(`[Backfill JET] ===== RESUMO FINAL =====`);
-    console.log(`[Backfill JET] Total: ${currentRun.total}`);
-    console.log(`[Backfill JET] Mapeamentos: ${currentRun.updated}`);
+    console.log(`\n[Backfill JET] ===== RESUMO FINAL =====`);
+    console.log(`[Backfill JET] Total processados: ${currentRun.total}`);
+    console.log(`[Backfill JET] Pedidos enriquecidos: ${currentRun.updated}`);
     console.log(`[Backfill JET] Eventos criados: ${currentRun.events_created}`);
     console.log(`[Backfill JET] Erros: ${currentRun.errors}`);
     console.log(`[Backfill JET] Ignorados: ${currentRun.skipped}`);
@@ -451,7 +455,7 @@ async function backfillJet({ onProgress } = {}) {
 }
 
 // ============================================================
-// CORRIGIR PEDIDOS EXISTENTES (NÃO CRIA EVENTOS)
+// CORRIGIR PEDIDOS EXISTENTES (metadados faltantes)
 // ============================================================
 async function corrigirPedidosExistentes({ onProgress } = {}) {
   if (currentRun && currentRun.status === "running") {
@@ -573,7 +577,8 @@ async function backfillAll({ dateFrom, dateTo, onProgress } = {}) {
 }
 
 async function recalcAllSla() {
-  console.log(`[Backfill] SLA recalculado`);
+  console.log(`[Backfill] Recalculando SLA...`);
+  // Implementar se necessário
 }
 
 async function getRunHistory(limit = 20) {

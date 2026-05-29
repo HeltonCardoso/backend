@@ -38,27 +38,51 @@ const isDuplicate = (key) => {
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 3. FUNÇÃO PARA CALCULAR SLA
+// 3. FUNÇÃO PARA CALCULAR SLA BASEADO NO PRAZO PROMETIDO DO PEDIDO
 // ──────────────────────────────────────────────────────────────────────────────
-function calcularSLA(createdAt) {
-  if (!createdAt) return { sla: 'ok', horas: 0 };
+function calcularSLA(createdAt, promisedShippingTime) {
+  if (!createdAt) return { sla: 'ok', horas: 0, prazoTotal: 0, percentual: 0, horasRestantes: 0 };
   
   const createdDate = new Date(createdAt);
   const agora = new Date();
   const horasDecorridas = (agora - createdDate) / (1000 * 60 * 60);
   
-  // Configuração dos limites (você pode ajustar)
-  const WARNING_HOURS = process.env.SLA_WARNING_HOURS ? parseFloat(process.env.SLA_WARNING_HOURS) : 36;
-  const CRITICAL_HOURS = process.env.SLA_CRITICAL_HOURS ? parseFloat(process.env.SLA_CRITICAL_HOURS) : 48;
+  // Calcula o prazo total baseado no promisedShippingTime
+  let prazoTotalHoras = null;
+  let dataLimite = null;
   
+  if (promisedShippingTime) {
+    dataLimite = new Date(promisedShippingTime);
+    prazoTotalHoras = (dataLimite - createdDate) / (1000 * 60 * 60);
+  }
+  
+  // Se não tem prazo prometido, usa fallback (48h)
+  if (!prazoTotalHoras || prazoTotalHoras <= 0) {
+    prazoTotalHoras = 48;
+    dataLimite = new Date(createdDate.getTime() + prazoTotalHoras * 60 * 60 * 1000);
+  }
+  
+  // Calcula percentual do prazo consumido
+  const percentualConsumido = Math.min(100, (horasDecorridas / prazoTotalHoras) * 100);
+  
+  // Define SLA baseado no percentual do prazo
   let sla = 'ok';
-  if (horasDecorridas >= CRITICAL_HOURS) {
+  if (percentualConsumido >= 100) {
     sla = 'critical';
-  } else if (horasDecorridas >= WARNING_HOURS) {
+  } else if (percentualConsumido >= 80) {
     sla = 'warning';
   }
   
-  return { sla, horas: horasDecorridas };
+  const horasRestantes = Math.max(0, prazoTotalHoras - horasDecorridas);
+  
+  return { 
+    sla, 
+    horas: horasDecorridas,
+    prazoTotal: prazoTotalHoras,
+    percentual: percentualConsumido,
+    dataLimite: dataLimite,
+    horasRestantes: horasRestantes
+  };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -102,6 +126,7 @@ function extrairInfoRelevante(dados) {
       status: dados.status || 'DESCONHECIDO',
       status_marketplace: dados.marketPlaceStatus || 'DESCONHECIDO',
       created_at: dados.createdAt || dados.created_at || new Date().toISOString(),
+      promised_shipping_time: dados.shipping?.promisedShippingTime || null,
       // ME2 detection (Mercado Livre)
       produtos: (dados.items || []).map(item => ({
         shippingtype: item.shippings?.[0]?.shippingtype || ''
@@ -157,14 +182,19 @@ async function processWebhook(payload) {
 
     const numeroMarketplace = infoEssencial.numero_marketplace;
     const createdAt = infoEssencial.created_at;
+    const promisedShippingTime = infoEssencial.promised_shipping_time;
 
-    // 3️⃣ CALCULAR SLA
-    const { sla: slaStatus, horas: horasDecorridas } = calcularSLA(createdAt);
+    // 3️⃣ CALCULAR SLA BASEADO NO PRAZO PROMETIDO
+    const slaInfo = calcularSLA(createdAt, promisedShippingTime);
 
     console.log(`✅ Marketplace ID obtido: ${numeroMarketplace}`);
     console.log(`🏪 Marketplace: ${infoEssencial.marketplace}`);
     console.log(`📊 Status: ${event} → ${STATUS_MAP[event] || event}`);
-    console.log(`⏱️ SLA: ${slaStatus} | Tempo decorrido: ${horasDecorridas.toFixed(1)}h`);
+    console.log(`⏱️ SLA: ${slaInfo.sla} | ${slaInfo.horas.toFixed(1)}h / ${slaInfo.prazoTotal.toFixed(1)}h (${slaInfo.percentual.toFixed(0)}%)`);
+    if (promisedShippingTime) {
+      console.log(`   📅 Prazo prometido: ${new Date(promisedShippingTime).toLocaleString('pt-BR')}`);
+      console.log(`   ⏳ Restam: ${slaInfo.horasRestantes.toFixed(1)}h`);
+    }
 
     // 4️⃣ SALVAR MAPEAMENTO
     await pool.query(
@@ -181,7 +211,7 @@ async function processWebhook(payload) {
     // 5️⃣ NORMALIZAR STATUS
     const normalizedStatus = STATUS_MAP[event] || event;
 
-    // 6️⃣ SALVAR TRACKING (com JSON COMPLETO e SLA!)
+    // 6️⃣ SALVAR TRACKING (com JSON COMPLETO e SLA baseado no prazo prometido)
     await pool.query(
       `INSERT INTO tracking_events 
        (id, pedido_id, origem, status, timestamp, payload, dados_completos, criado_em, sla_calculado, tempo_decorrido_horas) 
@@ -200,8 +230,8 @@ async function processWebhook(payload) {
         new Date(),
         JSON.stringify(payload),
         JSON.stringify(jsonCompleto),
-        slaStatus,
-        horasDecorridas
+        slaInfo.sla,
+        slaInfo.horas
       ]
     );
 
@@ -226,8 +256,8 @@ async function processWebhook(payload) {
           new Date(),
           JSON.stringify(payload),
           JSON.stringify(jsonCompleto),
-          slaStatus,
-          horasDecorridas
+          slaInfo.sla,
+          slaInfo.horas
         ]
       );
       console.log(`↩️ [RETORNO_ANYMARKET] Pedido ${numeroMarketplace} confirmado como enviado`);
@@ -280,14 +310,15 @@ async function processWebhook(payload) {
       numero_marketplace: numeroMarketplace,
       status: normalizedStatus,
       marketplace: infoEssencial.marketplace,
-      sla: slaStatus,
-      horas_decorridas: horasDecorridas.toFixed(1)
+      sla: slaInfo.sla,
+      horas_decorridas: slaInfo.horas.toFixed(1),
+      prazo_total: slaInfo.prazoTotal.toFixed(1),
+      percentual: slaInfo.percentual.toFixed(0)
     };
 
   } catch (error) {
     console.error('❌ Erro ao processar AnyMarket:', error.message);
     
-    // Registrar erro no log
     try {
       await pool.query(
         `INSERT INTO webhook_log (source, event_type, payload, received_at, processed, error)
@@ -332,7 +363,7 @@ async function fetchOrders(params) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 8. SINCRONIZAR PEDIDOS (buscar da API e salvar)
+// 8. SINCRONIZAR PEDIDOS
 // ──────────────────────────────────────────────────────────────────────────────
 async function syncOrders(since) {
   const sinceDate = since || new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
@@ -344,7 +375,7 @@ async function syncOrders(since) {
     if (jsonCompleto) {
       const infoEssencial = extrairInfoRelevante(jsonCompleto);
       if (infoEssencial?.numero_marketplace) {
-        const { sla: slaStatus, horas: horasDecorridas } = calcularSLA(infoEssencial.created_at);
+        const slaInfo = calcularSLA(infoEssencial.created_at, infoEssencial.promised_shipping_time);
         
         await pool.query(
           `INSERT INTO pedidos_mapeamento 
@@ -369,8 +400,8 @@ async function syncOrders(since) {
             new Date(infoEssencial.created_at),
             JSON.stringify({ event: 'backfill' }),
             JSON.stringify(jsonCompleto),
-            slaStatus,
-            horasDecorridas
+            slaInfo.sla,
+            slaInfo.horas
           ]
         );
         upserted++;

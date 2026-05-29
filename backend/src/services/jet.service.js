@@ -70,7 +70,7 @@ async function buscarDetalhesPedido(idOrder, tentativa = 1) {
           'apiKey': API_KEY,
           'Content-Type': 'application/json'
         },
-        timeout: 30000
+        timeout: 60000  // ⭐ AUMENTADO PARA 60 SEGUNDOS
       });
 
       if (response.data) {
@@ -82,6 +82,14 @@ async function buscarDetalhesPedido(idOrder, tentativa = 1) {
 
     } catch (error) {
       const status = error.response?.status;
+      const isTimeout = error.code === 'ECONNABORTED' || error.message?.includes('timeout');
+      
+      if (isTimeout) {
+        console.log(`⏳ Timeout na tentativa ${tentativaAtual}, aguardando ${tentativaAtual * 3}s...`);
+        await delay(tentativaAtual * 3000);  // Espera progressiva: 3s, 6s, 9s
+        continue;
+      }
+      
       console.log(`⚠️ Tentativa ${tentativaAtual} falhou: status ${status || error.message}`);
       
       if (status === 401) {
@@ -89,7 +97,15 @@ async function buscarDetalhesPedido(idOrder, tentativa = 1) {
         return null;
       }
       
-      if (tentativaAtual < maxTentativas) {
+      if (status === 404 && tentativaAtual < maxTentativas) {
+        console.log(`⚠️ Pedido ${idOrder} não encontrado, tentando novamente...`);
+        await delay(3000);
+        continue;
+      }
+      
+      if (tentativaAtual === maxTentativas) {
+        console.error(`❌ Falha ao buscar pedido ${idOrder} após ${maxTentativas} tentativas`);
+      } else if (!isTimeout) {
         await delay(2000);
       }
     }

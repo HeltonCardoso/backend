@@ -57,7 +57,7 @@ async function fetchOrders(params) {
 // CORRIGIDO: Salvar/atualizar pedido usando PostgreSQL
 async function upsertOrder(o) {
   const anymarketId = String(o.id);
-  const numeroMarketplace = String(o.marketPlaceId || o.marketplaceOrderId || "");
+  const numeroMarketplace = String(o.marketPlaceId || o.marketplaceOrderId || o.oi || "");
   const createdAt = o.createdAt || o.created_at || new Date().toISOString();
   const currentStatus = mapStatus(o.status || o.situationCode);
   
@@ -66,8 +66,8 @@ async function upsertOrder(o) {
   const marketplaceCanal = o.marketPlace || o.marketplaceName || null;
 
   if (!numeroMarketplace) {
-    console.error(`[Upsert] Pedido ${anymarketId} sem numero_marketplace, ignorando`);
-    return { error: 'sem_numero_marketplace' };
+    console.error(`[Upsert] Pedido ${anymarketId} sem numero_marketplace`);
+    return { action: 'ignored', error: 'sem_numero_marketplace' };
   }
 
   try {
@@ -80,22 +80,17 @@ async function upsertOrder(o) {
     );
 
     if (existing.rows.length > 0) {
-      const pedidoExistente = existing.rows[0];
-      
-      // Buscar último status registrado
+      // Buscar último status
       const lastEvent = await pool.query(
-        `SELECT status, timestamp 
-         FROM tracking_events 
-         WHERE pedido_id = $1 
-         ORDER BY timestamp DESC 
-         LIMIT 1`,
+        `SELECT status FROM tracking_events 
+         WHERE pedido_id = $1 ORDER BY timestamp DESC LIMIT 1`,
         [numeroMarketplace]
       );
       
       const lastStatus = lastEvent.rows[0]?.status;
       const statusChanged = lastStatus !== currentStatus;
       
-      // Atualiza dados do pedido
+      // Atualizar pedido
       await pool.query(`
         UPDATE pedidos_mapeamento 
         SET id_anymarket = $1, 
@@ -106,74 +101,58 @@ async function upsertOrder(o) {
         WHERE numero_marketplace = $5
       `, [anymarketId, marketplaceOrigem, loja, marketplaceCanal, numeroMarketplace]);
       
-      // Se status mudou, registrar evento
+      // CORRIGIDO: com ON CONFLICT
       if (statusChanged) {
         await pool.query(`
           INSERT INTO tracking_events (
             id, pedido_id, origem, status, timestamp, payload, criado_em, dados_completos
           )
           VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
+          ON CONFLICT (pedido_id, origem, status) 
+          DO UPDATE SET 
+            timestamp = EXCLUDED.timestamp,
+            payload = EXCLUDED.payload,
+            criado_em = NOW()
         `, [
-          uuidv4(), 
-          numeroMarketplace, 
-          'ANYMARKET', 
-          currentStatus, 
-          createdAt, 
-          JSON.stringify({ 
-            event: 'status_changed',
-            old_status: lastStatus, 
-            new_status: currentStatus,
-            order_id: anymarketId
-          }),
+          uuidv4(), numeroMarketplace, 'ANYMARKET', currentStatus, createdAt,
+          JSON.stringify({ event: 'status_changed', old_status: lastStatus, new_status: currentStatus }),
           JSON.stringify(o)
         ]);
         
-        console.log(`[Upsert] Pedido ${anymarketId} status alterado: ${lastStatus} → ${currentStatus}`);
+        console.log(`[Upsert] Pedido ${anymarketId}: ${lastStatus} → ${currentStatus}`);
       } else {
-        console.log(`[Upsert] Pedido ${anymarketId} atualizado (mesmo status: ${currentStatus})`);
+        console.log(`[Upsert] Pedido ${anymarketId} atualizado (mesmo status)`);
       }
       
-      return { action: 'updated', numero_marketplace: numeroMarketplace };
+      return { action: 'updated' };
       
     } else {
-      // INSERT - Novo pedido
+      // NOVO PEDIDO
       await pool.query(`
         INSERT INTO pedidos_mapeamento (
-          id_anymarket, 
-          numero_marketplace, 
-          marketplace_origem, 
-          loja, 
-          marketplace_canal,
-          criado_em, 
-          atualizado_em
+          id_anymarket, numero_marketplace, marketplace_origem, loja, marketplace_canal, criado_em, atualizado_em
         )
         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
       `, [anymarketId, numeroMarketplace, marketplaceOrigem, loja, marketplaceCanal]);
       
-      // Registrar primeiro evento
+      // CORRIGIDO: com ON CONFLICT
       await pool.query(`
         INSERT INTO tracking_events (
           id, pedido_id, origem, status, timestamp, payload, criado_em, dados_completos
         )
         VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
+        ON CONFLICT (pedido_id, origem, status) DO NOTHING
       `, [
-        uuidv4(), 
-        numeroMarketplace, 
-        'ANYMARKET', 
-        currentStatus, 
-        createdAt, 
-        JSON.stringify({ 
-          event: 'pedido_criado',
-          order_id: anymarketId
-        }),
+        uuidv4(), numeroMarketplace, 'ANYMARKET', currentStatus, createdAt,
+        JSON.stringify({ event: 'pedido_criado' }),
         JSON.stringify(o)
       ]);
       
-      console.log(`[Upsert] Pedido ${anymarketId} inserido (status: ${currentStatus})`);
-      return { action: 'inserted', numero_marketplace: numeroMarketplace };
+      console.log(`[Upsert] Pedido ${anymarketId} inserido`);
+      return { action: 'inserted' };
     }
   } catch (err) {
-    console.error(`[Upsert] Erro ao processar pedido ${anymarketId}:`, err.message);
+    console.error(`[Upsert] Erro:`, err.message);
     throw err;
   }
 }

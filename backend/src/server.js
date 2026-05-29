@@ -16,7 +16,7 @@ app.use(cors({ origin: "*" }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use('/api/meli', meliAuthRoutes);
-
+app.set('trust proxy', 1);
 // Loga todas as requisições em dev
 if (process.env.NODE_ENV !== "production") {
   app.use((req, _res, next) => {
@@ -25,6 +25,8 @@ if (process.env.NODE_ENV !== "production") {
   });
 }
 
+app.use(cors({ origin: "*" }));
+app.use(express.json());
 // ─── ROTAS ────────────────────────────────────────────────────────────────────
 app.use("/api/orders",   require("./routes/orders.routes"));
 app.use("/api/backfill", require("./routes/backfill.routes"));

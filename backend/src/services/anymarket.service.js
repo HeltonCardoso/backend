@@ -201,8 +201,8 @@ async function processWebhook(payload) {
     // Processar o pedido
     const result = await upsertOrder(payload);
 
-    // Marcar webhook como processado
-    await pool.query(`UPDATE webhook_log SET processed = true WHERE id = $1`, [logId]);
+    // CORRIGIDO: usar 1 em vez de true
+    await pool.query(`UPDATE webhook_log SET processed = 1 WHERE id = $1`, [logId]);
     
     console.log(`[Webhook Anymarket] Processado com sucesso: ${orderId}`);
     return { ok: true, orderId, result };

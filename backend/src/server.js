@@ -5,6 +5,7 @@ const express    = require("express");
 const cors       = require("cors");
 const cron       = require("node-cron");
 const path       = require("path");
+const fs         = require("fs");
 const syncRoutes = require('./routes/sync.routes');
 const meliAuthRoutes = require('./routes/meliAuth.routes');
 const meliOrdersService = require('./services/meliOrders.service');
@@ -17,6 +18,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use('/api/meli', meliAuthRoutes);
 app.set('trust proxy', 1);
+
 // Loga todas as requisições em dev
 if (process.env.NODE_ENV !== "production") {
   app.use((req, _res, next) => {
@@ -25,9 +27,7 @@ if (process.env.NODE_ENV !== "production") {
   });
 }
 
-app.use(cors({ origin: "*" }));
-app.use(express.json());
-// ─── ROTAS ────────────────────────────────────────────────────────────────────
+// ─── ROTAS DA API (TODAS antes do frontend) ───────────────────────────────────
 app.use("/api/orders",   require("./routes/orders.routes"));
 app.use("/api/backfill", require("./routes/backfill.routes"));
 app.use("/api/webhooks", require("./routes/webhook.routes"));  // ← Webhooks aqui!
@@ -79,15 +79,36 @@ cron.schedule("0 * * * *", () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// Servir os arquivos estáticos do React (build do Vite)
+// SERVIDOR DE ARQUIVOS ESTÁTICOS (React/Frontend)
 // ════════════════════════════════════════════════════════════════════════════
-app.use(express.static(path.join(process.cwd(), 'frontend/dist')));
 
-app.get('*', (req, res) => {
-  res.sendFile(path.join(process.cwd(), 'frontend/dist/index.html'));
-});
+const frontendDistPath = path.join(process.cwd(), 'frontend/dist');
 
-// ─── ERROR HANDLER ────────────────────────────────────────────────────────────
+if (fs.existsSync(frontendDistPath)) {
+  // Serve arquivos estáticos do frontend
+  app.use(express.static(frontendDistPath));
+  
+  // Fallback para SPA - NÃO captura rotas /api/
+  app.get('*', (req, res) => {
+    // Se for rota de API, retorna 404 em vez de mandar o frontend
+    if (req.path.startsWith('/api/')) {
+      return res.status(404).json({ error: `API endpoint not found: ${req.path}` });
+    }
+    res.sendFile(path.join(frontendDistPath, 'index.html'));
+  });
+} else {
+  console.log('⚠️ Frontend não encontrado, servindo apenas API');
+  // Fallback para rotas não encontradas
+  app.get('*', (req, res) => {
+    if (req.path.startsWith('/api/')) {
+      res.status(404).json({ error: `API endpoint not found: ${req.path}` });
+    } else {
+      res.status(404).send('Not found');
+    }
+  });
+}
+
+// ─── ERROR HANDLER (deve ser o ÚLTIMO) ────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error("[Error]", err.message);
   res.status(500).json({ error: err.message });
@@ -98,11 +119,16 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`\n🚀 Marketplace Monitor rodando na porta ${PORT}`);
   console.log(`   Health: http://localhost:${PORT}/health`);
-  console.log(`   Orders: http://localhost:${PORT}/api/orders`);
-  console.log(`   Webhook Anymarket: http://localhost:${PORT}/api/webhooks/anymarket`);
-  console.log(`   Webhook JET:       http://localhost:${PORT}/api/webhooks/jet`);
+  console.log(`   API Test: http://localhost:${PORT}/api/test-db`);
+  console.log(`   Webhook Anymarket: POST http://localhost:${PORT}/api/webhooks/anymarket`);
+  console.log(`   Webhook JET:       POST http://localhost:${PORT}/api/webhooks/jet`);
+  console.log(`   Webhook Test:      GET  http://localhost:${PORT}/api/webhooks/jet/test`);
   console.log(`   Backfill:          POST http://localhost:${PORT}/api/backfill/all\n`);
-  console.log(`   📱 Frontend React disponível em: http://localhost:${PORT}`);
+  
+  if (fs.existsSync(frontendDistPath)) {
+    console.log(`   📱 Frontend React: http://localhost:${PORT}`);
+  }
+  console.log(`   🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
 module.exports = app;

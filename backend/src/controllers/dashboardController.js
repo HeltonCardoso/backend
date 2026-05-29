@@ -238,7 +238,7 @@ const DashboardController = {
 
   async getPedidosPipeline(req, res) {
     try {
-      const { page = 1, limit = 20, marketplace, travados, loja, sort, quickFilter } = req.query;
+      const { page = 1, limit = 20, marketplace, travados, loja, sort, quickFilter, search } = req.query;
       const offset = (parseInt(page) - 1) * parseInt(limit);
 
       // ── Filtros base: exclui pedidos finalizados ───────────────────
@@ -259,7 +259,16 @@ const DashboardController = {
         params.push(loja);
         baseWhere += ` AND pm.loja = $${params.length}`;
       }
-
+      if (search) {
+        params.push(`%${search}%`);
+        baseWhere += ` AND (
+          te.pedido_id ILIKE $${params.length}
+          OR pm.id_anymarket ILIKE $${params.length}
+          OR pm.id_jet ILIKE $${params.length}
+          OR pm.id_onclick ILIKE $${params.length}
+          OR pm.loja ILIKE $${params.length}
+        )`;
+      }
       // ── Filtro "fora do prazo" aplicado no CTE externo ────────────
       // Caso 1: tem prazo e já venceu
       // Caso 2: não tem prazo e está sem update há mais de 1h

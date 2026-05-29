@@ -27,7 +27,6 @@ const TIPOS_ANOMALIA = {
   TRAVADO_SEM_ATUALIZACAO: { descricao: 'Pedido sem atualização por mais de 2 horas', severidade: 'HIGH' },
   RETORNO_JET_SEM_CONFIRMACAO_ANYMARKET: { descricao: 'JET enviou mas AnyMarket não confirmou', severidade: 'HIGH' },
   ONCLICK_FATUROU_SEM_RETORNO_JET: { descricao: 'ONCLICK faturou mas JET não confirmou envio', severidade: 'HIGH' },
-  // ⭐ NOVAS ANOMALIAS BASEADAS NO deliveryTime DA JET
   ATRASO_PRAZO_PREPARACAO: { descricao: 'Pedido NÃO foi despachado dentro do prazo de preparação (deliveryTime)', severidade: 'URGENTE' },
   PROXIMO_PRAZO_PREPARACAO: { descricao: 'Pedido próximo do prazo de preparação (deliveryTime)', severidade: 'WARNING' },
   DEMOROU_PARA_PRODUZIR: { descricao: 'Pedido demorou mais de 2h para entrar em produção', severidade: 'HIGH' },
@@ -71,30 +70,38 @@ function calcularPrazoDespacho(dadosCompletos, marketplace) {
   };
 }
 
+// ⭐ FUNÇÃO CORRIGIDA - SEM UUID, BANCO GERA ID AUTOMATICAMENTE
 async function createAnomaly(pedido_id, tipo, origem_falha, marketplace, metadata = {}) {
   try {
+    const pedidoIdStr = String(pedido_id);
+    
+    // Verificar se já existe anomalia NÃO RESOLVIDA do mesmo tipo
     const existing = await pool.query(
       `SELECT id FROM anomalias 
        WHERE pedido_id = $1 AND tipo = $2 AND resolvida = false 
        LIMIT 1`,
-      [pedido_id, tipo]
+      [pedidoIdStr, tipo]
     );
 
     if (existing.rows.length) {
-      console.log(`ℹ️ Anomalia ${tipo} para pedido ${pedido_id} já existe (não resolvida)`);
+      console.log(`ℹ️ Anomalia ${tipo} para pedido ${pedidoIdStr} já existe (não resolvida)`);
       return;
     }
 
-    await pool.query(
-      `INSERT INTO anomalias (id, pedido_id, tipo, origem_falha, marketplace, detalhes, criado_em, resolvida)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW(), false)`,
-      [uuidv4(), pedido_id, tipo, origem_falha, marketplace, JSON.stringify(metadata)]
+    // ⭐ NÃO envia UUID - deixa o banco gerar o ID automaticamente (SERIAL/BIGSERIAL)
+    const result = await pool.query(
+      `INSERT INTO anomalias (pedido_id, tipo, origem_falha, marketplace, detalhes, criado_em, resolvida)
+       VALUES ($1, $2, $3, $4, $5, NOW(), false)
+       RETURNING id`,
+      [pedidoIdStr, tipo, origem_falha, marketplace, JSON.stringify(metadata)]
     );
 
+    const anomalyId = result.rows[0].id;
     const infoAnomalia = TIPOS_ANOMALIA[tipo] || { descricao: tipo, severidade: 'MEDIUM' };
     
     console.log(`\n🚨 ANOMALIA DETECTADA!`);
-    console.log(`   Pedido: ${pedido_id}`);
+    console.log(`   ID: ${anomalyId}`);
+    console.log(`   Pedido: ${pedidoIdStr}`);
     console.log(`   Tipo: ${tipo}`);
     console.log(`   Descrição: ${infoAnomalia.descricao}`);
     console.log(`   Severidade: ${infoAnomalia.severidade}`);
@@ -111,14 +118,16 @@ async function createAnomaly(pedido_id, tipo, origem_falha, marketplace, metadat
   }
 }
 
-// ⭐ NOVA FUNÇÃO: Verificar prazo de preparação baseado no deliveryTime da JET
+// ⭐ FUNÇÃO CORRIGIDA - VERIFICAR PRAZO DE PREPARAÇÃO
 async function verificarPrazoPreparacao(pedido_id, marketplace) {
   try {
+    const pedidoIdStr = String(pedido_id);
+    
     const result = await pool.query(`
       SELECT delivery_time_jet, prazo_preparacao_horas, criado_em
       FROM pedidos_mapeamento
       WHERE numero_marketplace = $1
-    `, [pedido_id]);
+    `, [pedidoIdStr]);
 
     if (!result.rows.length) return;
 
@@ -126,13 +135,14 @@ async function verificarPrazoPreparacao(pedido_id, marketplace) {
     let prazoPreparacaoHoras = result.rows[0].prazo_preparacao_horas;
     const dataCriacao = result.rows[0].criado_em;
 
-    // Se não tem deliveryTime da JET, não consegue calcular
     if (deliveryTimeDias === null) {
       console.log(`   ⚠️ Sem deliveryTime da JET para este pedido`);
       return;
     }
 
-    const horasDecorridas = (new Date() - new Date(dataCriacao)) / (1000 * 60 * 60);
+    const dataCriacaoDate = new Date(dataCriacao);
+    const agora = new Date();
+    const horasDecorridas = (agora.getTime() - dataCriacaoDate.getTime()) / (1000 * 60 * 60);
     
     console.log(`   📦 DeliveryTime JET: ${deliveryTimeDias} dias ${deliveryTimeDias === 0 ? '(pronta entrega)' : ''}`);
     console.log(`   ⏰ Prazo preparação: ${prazoPreparacaoHoras}h`);
@@ -143,7 +153,7 @@ async function verificarPrazoPreparacao(pedido_id, marketplace) {
       SELECT id FROM tracking_events 
       WHERE pedido_id = $1 AND origem = 'RETORNO_JET'
       LIMIT 1
-    `, [pedido_id]);
+    `, [pedidoIdStr]);
 
     if (enviado.rows.length) {
       console.log(`   ✅ Pedido já foi enviado, prazo de preparação atendido`);
@@ -151,10 +161,10 @@ async function verificarPrazoPreparacao(pedido_id, marketplace) {
     }
 
     // Verificar se passou do prazo de preparação
-    if (horasDecorridas > prazoPreparacaoHoras) {
+    if (horasDecorridas > prazoPreparacaoHoras && prazoPreparacaoHoras > 0) {
       const atrasoHoras = (horasDecorridas - prazoPreparacaoHoras).toFixed(1);
       await createAnomaly(
-        pedido_id,
+        pedidoIdStr,
         'ATRASO_PRAZO_PREPARACAO',
         'JET',
         marketplace,
@@ -166,11 +176,10 @@ async function verificarPrazoPreparacao(pedido_id, marketplace) {
           atraso_horas: atrasoHoras
         }
       );
-    } else if (horasDecorridas > prazoPreparacaoHoras * 0.8) {
-      // Aviso quando estiver próximo do prazo (80%)
+    } else if (horasDecorridas > prazoPreparacaoHoras * 0.8 && prazoPreparacaoHoras > 0) {
       const horasRestantes = (prazoPreparacaoHoras - horasDecorridas).toFixed(1);
       await createAnomaly(
-        pedido_id,
+        pedidoIdStr,
         'PROXIMO_PRAZO_PREPARACAO',
         'JET',
         marketplace,
@@ -188,16 +197,18 @@ async function verificarPrazoPreparacao(pedido_id, marketplace) {
   }
 }
 
-// ⭐ NOVA FUNÇÃO: Analisar tempos de produção da JET
+// ⭐ FUNÇÃO CORRIGIDA - ANALISAR TEMPOS DE PRODUÇÃO
 async function analisarTemposProducao(pedido_id, marketplace) {
   try {
+    const pedidoIdStr = String(pedido_id);
+    
     const jetEvent = await pool.query(`
       SELECT dados_completos
       FROM tracking_events
       WHERE pedido_id = $1 AND origem = 'JET'
       ORDER BY timestamp ASC
       LIMIT 1
-    `, [pedido_id]);
+    `, [pedidoIdStr]);
 
     if (!jetEvent.rows.length) return;
 
@@ -213,21 +224,25 @@ async function analisarTemposProducao(pedido_id, marketplace) {
     const agora = new Date();
 
     if (dataIntegracao) {
-      console.log(`   📅 Integração JET: ${new Date(dataIntegracao).toLocaleString()}`);
+      const dataIntDate = new Date(dataIntegracao);
+      console.log(`   📅 Integração JET: ${dataIntDate.toLocaleString()}`);
     }
     if (dataProducao) {
-      console.log(`   🏭 Início produção: ${new Date(dataProducao).toLocaleString()}`);
+      const dataProdDate = new Date(dataProducao);
+      console.log(`   🏭 Início produção: ${dataProdDate.toLocaleString()}`);
     }
     if (dataPronto) {
-      console.log(`   ✅ Pronto para envio: ${new Date(dataPronto).toLocaleString()}`);
+      const dataProntoDate = new Date(dataPronto);
+      console.log(`   ✅ Pronto para envio: ${dataProntoDate.toLocaleString()}`);
     }
 
     // Verificar se demorou para começar a produzir
     if (dataIntegracao && !dataProducao) {
-      const horasEsperando = (agora - new Date(dataIntegracao)) / (1000 * 60 * 60);
+      const dataIntDate = new Date(dataIntegracao);
+      const horasEsperando = (agora.getTime() - dataIntDate.getTime()) / (1000 * 60 * 60);
       if (horasEsperando > 2) {
         await createAnomaly(
-          pedido_id,
+          pedidoIdStr,
           'DEMOROU_PARA_PRODUZIR',
           'JET',
           marketplace,
@@ -241,10 +256,11 @@ async function analisarTemposProducao(pedido_id, marketplace) {
 
     // Verificar se a produção está demorada
     if (dataProducao && !dataPronto) {
-      const horasEmProducao = (agora - new Date(dataProducao)) / (1000 * 60 * 60);
+      const dataProdDate = new Date(dataProducao);
+      const horasEmProducao = (agora.getTime() - dataProdDate.getTime()) / (1000 * 60 * 60);
       if (horasEmProducao > 48) {
         await createAnomaly(
-          pedido_id,
+          pedidoIdStr,
           'PRODUCAO_DEMORADA',
           'JET',
           marketplace,
@@ -258,10 +274,11 @@ async function analisarTemposProducao(pedido_id, marketplace) {
 
     // Verificar tempo total do pedido na JET
     if (dataIntegracao && !dataPronto) {
-      const tempoTotal = (agora - new Date(dataIntegracao)) / (1000 * 60 * 60);
+      const dataIntDate = new Date(dataIntegracao);
+      const tempoTotal = (agora.getTime() - dataIntDate.getTime()) / (1000 * 60 * 60);
       if (tempoTotal > 72) {
         await createAnomaly(
-          pedido_id,
+          pedidoIdStr,
           'PEDIDO_TRAVADO_JET',
           'JET',
           marketplace,
@@ -278,24 +295,27 @@ async function analisarTemposProducao(pedido_id, marketplace) {
   }
 }
 
+// ⭐ FUNÇÃO PRINCIPAL CORRIGIDA - checkPipelineStatus
 async function checkPipelineStatus(pedido_id) {
   try {
+    const pedidoIdStr = String(pedido_id);
+    
     const events = await pool.query(
       `SELECT origem, status, MAX(timestamp) as ultimo_evento
        FROM tracking_events
        WHERE pedido_id = $1
        GROUP BY origem, status
        ORDER BY ultimo_evento ASC`,
-      [pedido_id]
+      [pedidoIdStr]
     );
 
     if (!events.rows.length) {
-      console.log(`⚠️ Pedido ${pedido_id} sem eventos`);
+      console.log(`⚠️ Pedido ${pedidoIdStr} sem eventos`);
       return;
     }
 
     const origens = events.rows.map(r => r.origem);
-    const agora = Date.now();
+    const agora = new Date();
 
     const pedidoQuery = await pool.query(`
       SELECT 
@@ -305,7 +325,7 @@ async function checkPipelineStatus(pedido_id) {
       WHERE pedido_id = $1 AND origem = 'ANYMARKET'
       ORDER BY timestamp DESC
       LIMIT 1
-    `, [pedido_id]);
+    `, [pedidoIdStr]);
 
     const marketplace = pedidoQuery.rows[0]?.marketplace || 'default';
     const dadosCompletos = pedidoQuery.rows[0]?.dados_completos || {};
@@ -313,7 +333,7 @@ async function checkPipelineStatus(pedido_id) {
     const prazoInfo = calcularPrazoDespacho(dadosCompletos, marketplace);
     
     console.log(`\n${'═'.repeat(60)}`);
-    console.log(`📊 ANALISANDO PEDIDO ${pedido_id}`);
+    console.log(`📊 ANALISANDO PEDIDO ${pedidoIdStr}`);
     console.log(`${'═'.repeat(60)}`);
     console.log(`🏪 Marketplace: ${marketplace}`);
     console.log(`📅 Prazo de despacho (marketplace): ${prazoInfo.prazoHoras.toFixed(1)} horas`);
@@ -341,11 +361,11 @@ async function checkPipelineStatus(pedido_id) {
 
     if (temAnymarket && !temJet) {
       const eventoAnymarket = events.rows.find(r => r.origem === 'ANYMARKET');
-      const horasEsperando = (agora - new Date(eventoAnymarket.ultimo_evento)) / (1000 * 60 * 60);
+      const horasEsperando = (agora.getTime() - new Date(eventoAnymarket.ultimo_evento).getTime()) / (1000 * 60 * 60);
       const sla = SLA_ENTRE_ESTAGIOS.ANYMARKET_para_JET.horas;
 
       if (horasEsperando > sla) {
-        await createAnomaly(pedido_id, 'NAO_INTEGROU_JET', 'ANYMARKET', marketplace, {
+        await createAnomaly(pedidoIdStr, 'NAO_INTEGROU_JET', 'ANYMARKET', marketplace, {
           detalhes: `Pedido não integrou na JET após ${horasEsperando.toFixed(1)}h (SLA: ${sla}h = 30min)`,
           tempo_decorrido: horasEsperando.toFixed(1)
         });
@@ -357,11 +377,11 @@ async function checkPipelineStatus(pedido_id) {
     
     if (temJet && !temOnclick) {
       const eventoJet = events.rows.find(r => r.origem === 'JET');
-      const horasEsperando = (agora - new Date(eventoJet.ultimo_evento)) / (1000 * 60 * 60);
+      const horasEsperando = (agora.getTime() - new Date(eventoJet.ultimo_evento).getTime()) / (1000 * 60 * 60);
       const sla = SLA_ENTRE_ESTAGIOS.JET_para_ONCLICK.horas;
 
       if (horasEsperando > sla) {
-        await createAnomaly(pedido_id, 'NAO_ENTROU_ONCLICK', 'JET', marketplace, {
+        await createAnomaly(pedidoIdStr, 'NAO_ENTROU_ONCLICK', 'JET', marketplace, {
           detalhes: `JET integrou mas ONCLICK não processou após ${horasEsperando.toFixed(1)}h`,
           tempo_decorrido: horasEsperando.toFixed(1)
         });
@@ -374,11 +394,11 @@ async function checkPipelineStatus(pedido_id) {
     }, events.rows[0]);
 
     if (ultimoEventoGeral) {
-      const horasSemUpdate = (agora - new Date(ultimoEventoGeral.ultimo_evento)) / (1000 * 60 * 60);
+      const horasSemUpdate = (agora.getTime() - new Date(ultimoEventoGeral.ultimo_evento).getTime()) / (1000 * 60 * 60);
       const limiteTravado = 2;
 
       if (horasSemUpdate > limiteTravado && !statusFinais.includes(statusAtual)) {
-        await createAnomaly(pedido_id, 'TRAVADO_SEM_ATUALIZACAO', ultimoEventoGeral.origem, marketplace, {
+        await createAnomaly(pedidoIdStr, 'TRAVADO_SEM_ATUALIZACAO', ultimoEventoGeral.origem, marketplace, {
           detalhes: `Pedido sem atualização há ${horasSemUpdate.toFixed(1)} horas`,
           ultimo_status: ultimoEventoGeral.status,
           ultima_origem: ultimoEventoGeral.origem,
@@ -393,11 +413,11 @@ async function checkPipelineStatus(pedido_id) {
 
     if (temRetornoJet && !temRetornoAnymarket) {
       const eventoRetornoJet = events.rows.find(r => r.origem === 'RETORNO_JET');
-      const horasEsperando = (agora - new Date(eventoRetornoJet.ultimo_evento)) / (1000 * 60 * 60);
+      const horasEsperando = (agora.getTime() - new Date(eventoRetornoJet.ultimo_evento).getTime()) / (1000 * 60 * 60);
       const sla = 2;
 
       if (horasEsperando > sla) {
-        await createAnomaly(pedido_id, 'RETORNO_JET_SEM_CONFIRMACAO_ANYMARKET', 'RETORNO_JET', marketplace, {
+        await createAnomaly(pedidoIdStr, 'RETORNO_JET_SEM_CONFIRMACAO_ANYMARKET', 'RETORNO_JET', marketplace, {
           detalhes: `JET confirmou envio mas AnyMarket não confirmou recebimento há ${horasEsperando.toFixed(1)}h`,
           tempo_decorrido: horasEsperando.toFixed(1)
         });
@@ -410,11 +430,11 @@ async function checkPipelineStatus(pedido_id) {
 
     if (temOnclickFaturado && !temRetornoJetConfirmado) {
       const eventoOnclick = events.rows.find(r => r.origem === 'ONCLICK');
-      const horasEsperando = (agora - new Date(eventoOnclick.ultimo_evento)) / (1000 * 60 * 60);
+      const horasEsperando = (agora.getTime() - new Date(eventoOnclick.ultimo_evento).getTime()) / (1000 * 60 * 60);
       const sla = 1;
 
       if (horasEsperando > sla) {
-        await createAnomaly(pedido_id, 'ONCLICK_FATUROU_SEM_RETORNO_JET', 'ONCLICK', marketplace, {
+        await createAnomaly(pedidoIdStr, 'ONCLICK_FATUROU_SEM_RETORNO_JET', 'ONCLICK', marketplace, {
           detalhes: `ONCLICK faturou mas JET não confirmou envio há ${horasEsperando.toFixed(1)}h`,
           tempo_decorrido: horasEsperando.toFixed(1)
         });
@@ -424,7 +444,7 @@ async function checkPipelineStatus(pedido_id) {
     // 6. VERIFICAÇÃO: ONCLICK → ENVIO (prazo do marketplace)
     if (temOnclick) {
       const eventoOnclick = events.rows.find(r => r.origem === 'ONCLICK');
-      const tempoDecorrido = (agora - new Date(eventoOnclick.ultimo_evento)) / (1000 * 60 * 60);
+      const tempoDecorrido = (agora.getTime() - new Date(eventoOnclick.ultimo_evento).getTime()) / (1000 * 60 * 60);
       const temEnvio = origens.includes('RETORNO_JET') || origens.includes('ENVIADO');
       
       if (temEnvio) {
@@ -440,7 +460,7 @@ async function checkPipelineStatus(pedido_id) {
         
         if (prazoVencido) {
           const atrasoHoras = (tempoDecorrido - limiteEnvioHoras).toFixed(1);
-          await createAnomaly(pedido_id, 'ATRASO_ENVIO_PRAZO', 'ONCLICK', marketplace, {
+          await createAnomaly(pedidoIdStr, 'ATRASO_ENVIO_PRAZO', 'ONCLICK', marketplace, {
             detalhes: `Pedido NÃO foi enviado. Atraso de ${atrasoHoras}h`,
             tempo_decorrido: tempoDecorrido.toFixed(1),
             prazo_total: limiteEnvioHoras.toFixed(1),
@@ -448,7 +468,7 @@ async function checkPipelineStatus(pedido_id) {
           });
         } else if (alertaPrevio) {
           const horasRestantes = (limiteEnvioHoras - tempoDecorrido).toFixed(1);
-          await createAnomaly(pedido_id, 'PROXIMO_PRAZO_ENVIO', 'ONCLICK', marketplace, {
+          await createAnomaly(pedidoIdStr, 'PROXIMO_PRAZO_ENVIO', 'ONCLICK', marketplace, {
             detalhes: `Pedido próximo do prazo do marketplace. Faltam ${formatarHoras(parseFloat(horasRestantes))}`,
             tempo_decorrido: tempoDecorrido.toFixed(1),
             prazo_total: limiteEnvioHoras.toFixed(1),
@@ -458,11 +478,11 @@ async function checkPipelineStatus(pedido_id) {
       }
     }
 
-    // ⭐ 7. NOVA VERIFICAÇÃO: Prazo de preparação baseado no deliveryTime da JET
-    await verificarPrazoPreparacao(pedido_id, marketplace);
+    // 7. VERIFICAÇÃO: Prazo de preparação baseado no deliveryTime da JET
+    await verificarPrazoPreparacao(pedidoIdStr, marketplace);
 
-    // ⭐ 8. NOVA VERIFICAÇÃO: Tempos de produção da JET
-    await analisarTemposProducao(pedido_id, marketplace);
+    // 8. VERIFICAÇÃO: Tempos de produção da JET
+    await analisarTemposProducao(pedidoIdStr, marketplace);
 
     console.log(`${'═'.repeat(60)}\n`);
 

@@ -47,7 +47,6 @@ function calcularSLA(createdAt, promisedShippingTime) {
   const agora = new Date();
   const horasDecorridas = (agora - createdDate) / (1000 * 60 * 60);
   
-  // Calcula o prazo total baseado no promisedShippingTime
   let prazoTotalHoras = null;
   let dataLimite = null;
   
@@ -56,16 +55,13 @@ function calcularSLA(createdAt, promisedShippingTime) {
     prazoTotalHoras = (dataLimite - createdDate) / (1000 * 60 * 60);
   }
   
-  // Se não tem prazo prometido, usa fallback (48h)
   if (!prazoTotalHoras || prazoTotalHoras <= 0) {
     prazoTotalHoras = 48;
     dataLimite = new Date(createdDate.getTime() + prazoTotalHoras * 60 * 60 * 1000);
   }
   
-  // Calcula percentual do prazo consumido
   const percentualConsumido = Math.min(100, (horasDecorridas / prazoTotalHoras) * 100);
   
-  // Define SLA baseado no percentual do prazo
   let sla = 'ok';
   if (percentualConsumido >= 100) {
     sla = 'critical';
@@ -123,12 +119,12 @@ function extrairInfoRelevante(dados) {
       numero_marketplace: dados.marketPlaceId,
       marketplace_number: dados.marketPlaceNumber || dados.marketPlaceId,
       marketplace: dados.marketPlace,
-      loja: dados.accountName, 
+      loja: dados.accountName || null,                          // ← CAMPO LOJA
+      marketplace_canal: dados.marketPlace || null,             // ← CAMPO CANAL
       status: dados.status || 'DESCONHECIDO',
       status_marketplace: dados.marketPlaceStatus || 'DESCONHECIDO',
       created_at: dados.createdAt || dados.created_at || new Date().toISOString(),
       promised_shipping_time: dados.shipping?.promisedShippingTime || null,
-      // ME2 detection (Mercado Livre)
       produtos: (dados.items || []).map(item => ({
         shippingtype: item.shippings?.[0]?.shippingtype || ''
       }))
@@ -184,12 +180,16 @@ async function processWebhook(payload) {
     const numeroMarketplace = infoEssencial.numero_marketplace;
     const createdAt = infoEssencial.created_at;
     const promisedShippingTime = infoEssencial.promised_shipping_time;
+    const loja = infoEssencial.loja;
+    const marketplaceCanal = infoEssencial.marketplace_canal;
+    const prazoDespacho = promisedShippingTime ? new Date(promisedShippingTime) : null;
 
     // 3️⃣ CALCULAR SLA BASEADO NO PRAZO PROMETIDO
     const slaInfo = calcularSLA(createdAt, promisedShippingTime);
 
     console.log(`✅ Marketplace ID obtido: ${numeroMarketplace}`);
     console.log(`🏪 Marketplace: ${infoEssencial.marketplace}`);
+    console.log(`🏷️ Loja: ${loja || 'não informada'}`);
     console.log(`📊 Status: ${event} → ${STATUS_MAP[event] || event}`);
     console.log(`⏱️ SLA: ${slaInfo.sla} | ${slaInfo.horas.toFixed(1)}h / ${slaInfo.prazoTotal.toFixed(1)}h (${slaInfo.percentual.toFixed(0)}%)`);
     if (promisedShippingTime) {
@@ -197,22 +197,39 @@ async function processWebhook(payload) {
       console.log(`   ⏳ Restam: ${slaInfo.horasRestantes.toFixed(1)}h`);
     }
 
-    // 4️⃣ SALVAR MAPEAMENTO
+    // 4️⃣ SALVAR MAPEAMENTO (COM TODOS OS CAMPOS)
     await pool.query(
       `INSERT INTO pedidos_mapeamento 
-       (id_anymarket, numero_marketplace, marketplace_origem, criado_em, atualizado_em)
-       VALUES ($1, $2, $3, NOW(), NOW())
+       (id_anymarket, 
+        numero_marketplace, 
+        marketplace_origem, 
+        marketplace_canal,
+        loja, 
+        prazo_despacho, 
+        criado_em, 
+        atualizado_em)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
        ON CONFLICT (numero_marketplace) DO UPDATE SET
-         id_anymarket = $1,
-         marketplace_origem = $3,
+         id_anymarket = EXCLUDED.id_anymarket,
+         marketplace_origem = EXCLUDED.marketplace_origem,
+         marketplace_canal = COALESCE(pedidos_mapeamento.marketplace_canal, EXCLUDED.marketplace_canal),
+         loja = COALESCE(pedidos_mapeamento.loja, EXCLUDED.loja),
+         prazo_despacho = COALESCE(pedidos_mapeamento.prazo_despacho, EXCLUDED.prazo_despacho),
          atualizado_em = NOW()`,
-      [idAnyMarket, numeroMarketplace, infoEssencial.marketplace]
+      [
+        idAnyMarket,
+        numeroMarketplace,
+        infoEssencial.marketplace,
+        marketplaceCanal,
+        loja,
+        prazoDespacho
+      ]
     );
 
     // 5️⃣ NORMALIZAR STATUS
     const normalizedStatus = STATUS_MAP[event] || event;
 
-    // 6️⃣ SALVAR TRACKING (com JSON COMPLETO e SLA baseado no prazo prometido)
+    // 6️⃣ SALVAR TRACKING (com JSON COMPLETO e SLA)
     await pool.query(
       `INSERT INTO tracking_events 
        (id, pedido_id, origem, status, timestamp, payload, dados_completos, criado_em, sla_calculado, tempo_decorrido_horas) 
@@ -311,6 +328,7 @@ async function processWebhook(payload) {
       numero_marketplace: numeroMarketplace,
       status: normalizedStatus,
       marketplace: infoEssencial.marketplace,
+      loja: loja,
       sla: slaInfo.sla,
       horas_decorridas: slaInfo.horas.toFixed(1),
       prazo_total: slaInfo.prazoTotal.toFixed(1),
@@ -377,23 +395,28 @@ async function syncOrders(since) {
       const infoEssencial = extrairInfoRelevante(jsonCompleto);
       if (infoEssencial?.numero_marketplace) {
         const slaInfo = calcularSLA(infoEssencial.created_at, infoEssencial.promised_shipping_time);
+        const prazoDespacho = infoEssencial.promised_shipping_time ? new Date(infoEssencial.promised_shipping_time) : null;
         
-          await pool.query(
-            `INSERT INTO pedidos_mapeamento 
-            (id_anymarket, numero_marketplace, marketplace_origem, loja, criado_em, atualizado_em)
-            VALUES ($1, $2, $3, $4, NOW(), NOW())
-            ON CONFLICT (numero_marketplace) DO UPDATE SET
-              id_anymarket = EXCLUDED.id_anymarket,
-              marketplace_origem = EXCLUDED.marketplace_origem,
-              loja = COALESCE(EXCLUDED.loja, pedidos_mapeamento.loja),  -- ← Não sobrescreve
-              atualizado_em = NOW()`,
-            [
-              infoEssencial.id_anymarket,
-              infoEssencial.numero_marketplace,
-              infoEssencial.marketplace,
-              infoEssencial.loja  // ← ADICIONAR
-            ]
-          );
+        await pool.query(
+          `INSERT INTO pedidos_mapeamento 
+           (id_anymarket, numero_marketplace, marketplace_origem, marketplace_canal, loja, prazo_despacho, criado_em, atualizado_em)
+           VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+           ON CONFLICT (numero_marketplace) DO UPDATE SET
+             id_anymarket = EXCLUDED.id_anymarket,
+             marketplace_origem = EXCLUDED.marketplace_origem,
+             marketplace_canal = COALESCE(pedidos_mapeamento.marketplace_canal, EXCLUDED.marketplace_canal),
+             loja = COALESCE(pedidos_mapeamento.loja, EXCLUDED.loja),
+             prazo_despacho = COALESCE(pedidos_mapeamento.prazo_despacho, EXCLUDED.prazo_despacho),
+             atualizado_em = NOW()`,
+          [
+            o.id, 
+            infoEssencial.numero_marketplace, 
+            infoEssencial.marketplace,
+            infoEssencial.marketplace_canal,
+            infoEssencial.loja,
+            prazoDespacho
+          ]
+        );
         
         await pool.query(
           `INSERT INTO tracking_events 

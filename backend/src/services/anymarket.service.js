@@ -123,6 +123,7 @@ function extrairInfoRelevante(dados) {
       numero_marketplace: dados.marketPlaceId,
       marketplace_number: dados.marketPlaceNumber || dados.marketPlaceId,
       marketplace: dados.marketPlace,
+      loja: dados.accountName, 
       status: dados.status || 'DESCONHECIDO',
       status_marketplace: dados.marketPlaceStatus || 'DESCONHECIDO',
       created_at: dados.createdAt || dados.created_at || new Date().toISOString(),
@@ -377,15 +378,22 @@ async function syncOrders(since) {
       if (infoEssencial?.numero_marketplace) {
         const slaInfo = calcularSLA(infoEssencial.created_at, infoEssencial.promised_shipping_time);
         
-        await pool.query(
-          `INSERT INTO pedidos_mapeamento 
-           (id_anymarket, numero_marketplace, marketplace_origem, criado_em, atualizado_em)
-           VALUES ($1, $2, $3, NOW(), NOW())
-           ON CONFLICT (numero_marketplace) DO UPDATE SET
-             id_anymarket = $1,
-             atualizado_em = NOW()`,
-          [o.id, infoEssencial.numero_marketplace, infoEssencial.marketplace]
-        );
+          await pool.query(
+            `INSERT INTO pedidos_mapeamento 
+            (id_anymarket, numero_marketplace, marketplace_origem, loja, criado_em, atualizado_em)
+            VALUES ($1, $2, $3, $4, NOW(), NOW())
+            ON CONFLICT (numero_marketplace) DO UPDATE SET
+              id_anymarket = EXCLUDED.id_anymarket,
+              marketplace_origem = EXCLUDED.marketplace_origem,
+              loja = COALESCE(EXCLUDED.loja, pedidos_mapeamento.loja),  -- ← Não sobrescreve
+              atualizado_em = NOW()`,
+            [
+              infoEssencial.id_anymarket,
+              infoEssencial.numero_marketplace,
+              infoEssencial.marketplace,
+              infoEssencial.loja  // ← ADICIONAR
+            ]
+          );
         
         await pool.query(
           `INSERT INTO tracking_events 

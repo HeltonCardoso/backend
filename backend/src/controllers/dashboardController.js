@@ -2,29 +2,32 @@
 const pool = require('../../config/database');
 
 const DESCRICAO_ANOMALIA = {
-  NAO_INTEGROU_JET:     'Pedido não chegou na JET dentro do prazo',
-  NAO_FATUROU_ONCLICK:  'JET integrou mas Onclick não faturou',
-  FATUROU_NAO_RETORNOU: 'Onclick faturou mas JET não confirmou envio',
-  FATURADO_APOS_ENVIO:  'AnyMarket travado em faturado',
-  ENVIADO_SEM_FATURAMENTO: 'JET enviou sem confirmação de faturamento',
-  TRAVADO:              'Pedido sem atualização por mais de 1 hora',
-  NAO_ENTROU_ONCLICK:   'JET integrou mas pedido não entrou na Onclick',
-  PROXIMO_PRAZO_ENVIO:  'Pedido próximo do prazo de despacho',
-  ATRASO_ENVIO_PRAZO:   'Pedido ULTRAPASSOU o prazo de despacho'
+  NAO_INTEGROU_JET: 'Pedido não chegou na JET dentro do prazo (30min)',
+  NAO_ENTROU_ONCLICK: 'JET integrou mas Onclick não processou (1h)',
+  FATURADO_APOS_ENVIO: 'AnyMarket travado em faturado',
+  ENVIADO_SEM_PRODUCAO: 'JET enviou sem confirmação de produção',
+  PROXIMO_PRAZO_ENVIO: 'Pedido próximo do prazo de despacho',
+  ATRASO_ENVIO_PRAZO: 'Pedido ULTRAPASSOU o prazo de despacho',
+  PARADO_SEM_EVOLUCAO: 'Pedido sem atualização há mais que o prazo de preparação',
+  RETORNO_JET_SEM_CONFIRMACAO_ANYMARKET: 'JET enviou mas AnyMarket não confirmou',
+  ONCLICK_FATUROU_SEM_RETORNO_JET: 'ONCLICK faturou mas JET não confirmou envio',
+  ATRASO_PRAZO_PREPARACAO: 'Pedido atrasado no prazo de preparação',
+  PROXIMO_PRAZO_PREPARACAO: 'Pedido próximo do prazo de preparação',
+  DEMOROU_PARA_PRODUZIR: 'Pedido demorou mais de 2h para entrar em produção',
+  PRODUCAO_DEMORADA: 'Pedido em produção há mais de 48h',
+  PEDIDO_TRAVADO_JET: 'Pedido travado na JET há mais de 72h'
 };
 
 const DashboardController = {
 
   async getMetricasGerais(req, res) {
     try {
-      // CORRIGIDO: Ordem correta do pipeline baseada no nível de progresso
+      // Pipeline stages
       const origemResult = await pool.query(`
         WITH niveis_origem AS (
           SELECT DISTINCT ON (te.pedido_id)
             te.pedido_id,
             CASE 
-              -- Prioridade: maior número = mais avançado
-              -- Ordem correta do fluxo: ANYMARKET(1) → JET(2) → ONCLICK(3) → RETORNO_JET(4) → RETORNO_ANYMARKET(5)
               WHEN te.origem = 'RETORNO_ANYMARKET' THEN 5
               WHEN te.origem = 'RETORNO_JET' THEN 4
               WHEN te.origem = 'ONCLICK' THEN 3
@@ -41,32 +44,51 @@ const DashboardController = {
           )
           ORDER BY te.pedido_id, prioridade DESC, te.timestamp DESC
         )
-        SELECT 
-          origem_atual as origem,
-          COUNT(*) as total
+        SELECT origem_atual as origem, COUNT(*) as total
         FROM niveis_origem
         WHERE origem_atual IS NOT NULL
         GROUP BY origem_atual
       `);
       
-      // Garantir que TODAS as origens existam no objeto (mesmo com 0)
-      const metricas = { 
-        ANYMARKET: 0, 
-        JET: 0, 
-        ONCLICK: 0, 
-        RETORNO_JET: 0,
-        RETORNO_ANYMARKET: 0
+      const metricas = { ANYMARKET: 0, JET: 0, ONCLICK: 0, RETORNO_JET: 0, RETORNO_ANYMARKET: 0 };
+      origemResult.rows.forEach(r => { metricas[r.origem] = parseInt(r.total); });
+
+      // Anomalias por tipo
+      const anomaliasPorTipo = await pool.query(`
+        SELECT tipo, COUNT(*) as total
+        FROM anomalias 
+        WHERE resolvida = false
+        GROUP BY tipo
+      `);
+      
+      const anomaliasMap = {};
+      anomaliasPorTipo.rows.forEach(r => { anomaliasMap[r.tipo] = parseInt(r.total); });
+      
+      const anomaliasDetalhadas = {
+        nao_integrou_jet: anomaliasMap['NAO_INTEGROU_JET'] || 0,
+        nao_entrou_onclick: anomaliasMap['NAO_ENTROU_ONCLICK'] || 0,
+        faturado_apos_envio: anomaliasMap['FATURADO_APOS_ENVIO'] || 0,
+        enviado_sem_producao: anomaliasMap['ENVIADO_SEM_PRODUCAO'] || 0,
+        atraso_envio_prazo: anomaliasMap['ATRASO_ENVIO_PRAZO'] || 0,
+        parado_sem_evolucao: anomaliasMap['PARADO_SEM_EVOLUCAO'] || 0,
+        proximo_prazo_envio: anomaliasMap['PROXIMO_PRAZO_ENVIO'] || 0,
+        pedido_travado_jet: anomaliasMap['PEDIDO_TRAVADO_JET'] || 0,
+        retorno_jet_sem_confirmacao: anomaliasMap['RETORNO_JET_SEM_CONFIRMACAO_ANYMARKET'] || 0,
+        atraso_prazo_preparacao: anomaliasMap['ATRASO_PRAZO_PREPARACAO'] || 0,
+        demorou_para_produzir: anomaliasMap['DEMOROU_PARA_PRODUZIR'] || 0,
+        producao_demorada: anomaliasMap['PRODUCAO_DEMORADA'] || 0
       };
       
-      origemResult.rows.forEach(r => { 
-        metricas[r.origem] = parseInt(r.total); 
-      });
-
-      const anomaliasResult = await pool.query(
-        `SELECT COUNT(*) AS total FROM anomalias WHERE resolvida = false`
-      );
-      const anomaliasNaoResolvidas = parseInt(anomaliasResult.rows[0].total);
-
+      const totalAnomalias = Object.values(anomaliasDetalhadas).reduce((a, b) => a + b, 0);
+      
+      // Pedidos travados
+      const pedidosTravados = await pool.query(`
+        SELECT COUNT(DISTINCT a.pedido_id) as total
+        FROM anomalias a
+        WHERE a.resolvida = false
+          AND a.tipo IN ('ATRASO_ENVIO_PRAZO', 'PARADO_SEM_EVOLUCAO', 'PEDIDO_TRAVADO_JET')
+      `);
+      
       const pipelineResult = await pool.query(`
         WITH ultimo_estagio AS (
           SELECT DISTINCT ON (te.pedido_id)
@@ -99,41 +121,6 @@ const DashboardController = {
       const porEstagio = {};
       pipelineResult.rows.forEach(r => { porEstagio[r.estagio] = parseInt(r.total); });
 
-      const travadosResult = await pool.query(`
-        WITH ultimo_evento AS (
-          SELECT DISTINCT ON (te.pedido_id)
-            te.pedido_id, 
-            te.origem, 
-            te.status, 
-            te.timestamp,
-            pm.prazo_despacho
-          FROM tracking_events te
-          LEFT JOIN pedidos_mapeamento pm ON te.pedido_id = pm.numero_marketplace
-          ORDER BY te.pedido_id, te.timestamp DESC
-        ),
-        pedidos_finalizados AS (
-          SELECT pedido_id FROM tracking_events
-          WHERE origem = 'ANYMARKET' 
-          AND status IN ('ENTREGUE', 'CANCELADO', 'CONCLUDED', 'CANCELED')
-        ),
-        pedidos_completos AS (
-          SELECT pedido_id FROM tracking_events
-          WHERE origem = 'RETORNO_ANYMARKET'
-        )
-        SELECT COUNT(*) as total
-        FROM ultimo_evento u
-        WHERE u.pedido_id NOT IN (SELECT pedido_id FROM pedidos_finalizados)
-          AND u.pedido_id NOT IN (SELECT pedido_id FROM pedidos_completos)
-          AND u.origem NOT IN ('RETORNO_ANYMARKET','RETORNO_MARKETPLACE')
-          AND u.status NOT IN ('ENTREGUE', 'CANCELADO', 'CONCLUDED', 'CANCELED')
-          AND (
-            (u.prazo_despacho IS NOT NULL AND NOW() > u.prazo_despacho)
-            OR
-            (u.prazo_despacho IS NULL AND u.timestamp < NOW() - INTERVAL '1 hour')
-          )
-      `);
-      const pedidosTravados = parseInt(travadosResult.rows[0].total);
-
       const marketplaceResult = await pool.query(`
         SELECT 
           pm.marketplace_origem as marketplace,
@@ -146,6 +133,7 @@ const DashboardController = {
           AND te.status NOT IN ('ENTREGUE', 'CANCELADO', 'CONCLUDED', 'CANCELED')
         GROUP BY pm.marketplace_origem
         ORDER BY total DESC
+        LIMIT 10
       `);
 
       const anymarketNaoFinalizados = await pool.query(`
@@ -172,9 +160,7 @@ const DashboardController = {
       
       const totalAnymarketAtivos = parseInt(anymarketNaoFinalizados.rows[0].total) || 0;
       const totalJetAtivos = parseInt(jetNaoFinalizados.rows[0].total) || 0;
-      const taxaSync = totalAnymarketAtivos > 0
-        ? ((totalJetAtivos / totalAnymarketAtivos) * 100).toFixed(1)
-        : 0;
+      const taxaSync = totalAnymarketAtivos > 0 ? ((totalJetAtivos / totalAnymarketAtivos) * 100).toFixed(1) : 0;
 
       const pedidos24hResult = await pool.query(`
         SELECT COUNT(DISTINCT te.pedido_id) as total
@@ -192,8 +178,9 @@ const DashboardController = {
         success: true,
         data: {
           metricas,
-          anomaliasNaoResolvidas,
-          pedidosTravados,
+          anomalias: anomaliasDetalhadas,
+          anomaliasNaoResolvidas: totalAnomalias,
+          pedidosTravados: parseInt(pedidosTravados.rows[0].total) || 0,
           porEstagio,
           taxaSincronizacaoJet: parseFloat(taxaSync),
           pedidos24h: parseInt(pedidos24hResult.rows[0].total),
@@ -208,20 +195,34 @@ const DashboardController = {
 
   async getAnomalias(req, res) {
     try {
-      const { limit = 20, resolvida } = req.query;
+      const { limit = 50, offset = 0, resolvida, tipo } = req.query;
       const params = [];
       let where = 'WHERE 1=1';
+      
       if (resolvida !== undefined) {
         params.push(resolvida === 'true');
         where += ` AND resolvida = $${params.length}`;
       }
-      params.push(parseInt(limit));
+      
+      if (tipo) {
+        params.push(tipo);
+        where += ` AND tipo = $${params.length}`;
+      }
+      
+      // Query de contagem
+      const countResult = await pool.query(`
+        SELECT COUNT(*) as total FROM anomalias ${where}
+      `, params);
+      const total = parseInt(countResult.rows[0].total);
+      
+      // Query com paginação
+      params.push(parseInt(limit), parseInt(offset));
       const result = await pool.query(`
-        SELECT id, pedido_id, tipo, origem_falha, marketplace, criado_em, resolvida
+        SELECT id, pedido_id, tipo, origem_falha, marketplace, criado_em, resolvida, detalhes
         FROM anomalias
         ${where}
         ORDER BY criado_em DESC
-        LIMIT $${params.length}
+        LIMIT $${params.length - 1} OFFSET $${params.length}
       `, params);
 
       const anomalias = result.rows.map(a => ({
@@ -229,7 +230,13 @@ const DashboardController = {
         descricao: DESCRICAO_ANOMALIA[a.tipo] || a.tipo
       }));
 
-      res.json({ success: true, anomalias });
+      res.json({ 
+        success: true, 
+        anomalias,
+        total,
+        limit: parseInt(limit),
+        offset: parseInt(offset)
+      });
     } catch (error) {
       console.error('Erro getAnomalias:', error);
       res.status(500).json({ success: false, error: error.message });
@@ -238,10 +245,9 @@ const DashboardController = {
 
   async getPedidosPipeline(req, res) {
     try {
-      const { page = 1, limit = 20, marketplace, travados, loja, sort, quickFilter, search } = req.query;
+      const { page = 1, limit = 20, marketplace, loja, sort, quickFilter, search, anomaliaTipo } = req.query;
       const offset = (parseInt(page) - 1) * parseInt(limit);
 
-      // ── Filtros base: exclui pedidos finalizados ───────────────────
       let baseWhere = `WHERE te.origem IN ('ANYMARKET','JET','ONCLICK','RETORNO_JET','RETORNO_ANYMARKET')
         AND te.pedido_id NOT IN (
           SELECT pedido_id FROM tracking_events
@@ -259,6 +265,7 @@ const DashboardController = {
         params.push(loja);
         baseWhere += ` AND pm.loja = $${params.length}`;
       }
+      
       if (search) {
         params.push(`%${search}%`);
         baseWhere += ` AND (
@@ -269,115 +276,100 @@ const DashboardController = {
           OR pm.loja ILIKE $${params.length}
         )`;
       }
-      // ── Filtro "fora do prazo" aplicado no CTE externo ────────────
-      // Caso 1: tem prazo e já venceu
-      // Caso 2: não tem prazo e está sem update há mais de 1h
-      // (os dois são OR — qualquer um já caracteriza "fora do prazo")
-      const travadosFiltro = travados === 'true'
-        ? `AND (
-             (prazo_despacho IS NOT NULL AND prazo_despacho < NOW())
-             OR
-             (prazo_despacho IS NULL AND horas_sem_update > 1)
-           )`
-        : '';
+      
+      // Filtro por tipo de anomalia
+      let anomaliaFilter = '';
+      if (anomaliaTipo && anomaliaTipo !== '') {
+        params.push(anomaliaTipo);
+        anomaliaFilter = ` AND a.tipo = $${params.length}`;
+      }
 
-      // ── Quick filters dos contadores clicáveis ─────────────────────
-      const quickFilterClause = {
-        foraPrazo: `AND (
-                      (prazo_despacho IS NOT NULL AND prazo_despacho < NOW())
-                      OR (prazo_despacho IS NULL AND horas_sem_update > 1)
-                    )`,
-        urgentes:  `AND prazo_despacho IS NOT NULL
-                    AND prazo_despacho >= NOW()
-                    AND prazo_despacho < NOW() + INTERVAL '24 hours'`,
-        semPrazo:  `AND prazo_despacho IS NULL`,
-      }[quickFilter] || '';
+      const travadosFiltro = quickFilter === 'foraPrazo' ? `AND (
+        (prazo_despacho IS NOT NULL AND prazo_despacho < NOW())
+        OR (prazo_despacho IS NULL AND horas_sem_update > 1)
+      )` : '';
 
-      // ── Ordenação ─────────────────────────────────────────────────
-      // prazo_asc  → urgentes/atrasados primeiro (menor horas_ate_prazo, negativos sobem)
-      // prazo_desc → mais atrasados primeiro (idem — valor mais negativo = mais atrasado)
-      // parado_desc → parado há mais tempo primeiro
       const orderBy = {
-        prazo_asc:   'horas_ate_prazo ASC NULLS LAST',
-        prazo_desc:  'horas_ate_prazo ASC NULLS LAST',
+        prazo_asc: 'horas_ate_prazo ASC NULLS LAST',
+        prazo_desc: 'horas_ate_prazo ASC NULLS LAST',
         parado_desc: 'horas_sem_update DESC NULLS LAST',
       }[sort] || 'ultimo_evento DESC NULLS LAST';
 
-      // ── Query principal com paginação ──────────────────────────────
       const pedidosQuery = `
         WITH eventos_pedido AS (
           SELECT
             te.pedido_id,
             ARRAY_AGG(DISTINCT te.origem) AS origens,
-            MAX(te.timestamp)             AS ultimo_evento,
-            MIN(te.timestamp)             AS primeiro_evento,
-            pm.marketplace_origem         AS marketplace,
+            MAX(te.timestamp) AS ultimo_evento,
+            MIN(te.timestamp) AS primeiro_evento,
+            pm.marketplace_origem AS marketplace,
             pm.loja,
             pm.id_anymarket,
             pm.id_jet,
             pm.id_onclick,
             pm.prazo_despacho,
-            EXTRACT(EPOCH FROM (NOW() - MAX(te.timestamp))) / 3600          AS horas_sem_update,
+            EXTRACT(EPOCH FROM (NOW() - MAX(te.timestamp))) / 3600 AS horas_sem_update,
             CASE
               WHEN pm.prazo_despacho IS NOT NULL
               THEN EXTRACT(EPOCH FROM (pm.prazo_despacho - NOW())) / 3600
               ELSE NULL
-            END AS horas_ate_prazo
+            END AS horas_ate_prazo,
+            a.tipo AS anomalia_tipo,
+            a.descricao AS anomalia_descricao
           FROM tracking_events te
           LEFT JOIN pedidos_mapeamento pm ON te.pedido_id = pm.numero_marketplace
+          LEFT JOIN anomalias a ON te.pedido_id = a.pedido_id AND a.resolvida = false
           ${baseWhere}
           GROUP BY te.pedido_id, pm.marketplace_origem, pm.loja,
-                   pm.id_anymarket, pm.id_jet, pm.id_onclick, pm.prazo_despacho
+                   pm.id_anymarket, pm.id_jet, pm.id_onclick, pm.prazo_despacho,
+                   a.tipo, a.descricao
         )
         SELECT *
         FROM eventos_pedido
         WHERE 1=1
           ${travadosFiltro}
-          ${quickFilterClause}
+          ${anomaliaFilter}
         ORDER BY ${orderBy}
         LIMIT $${params.length + 1} OFFSET $${params.length + 2}
       `;
 
-      // ── Query de contagem total (com os mesmos filtros, sem paginação) ──
-      // Retorna também os totais para a barra de resumo do frontend.
       const countQuery = `
         WITH eventos_pedido AS (
           SELECT
             te.pedido_id,
             pm.prazo_despacho,
-            EXTRACT(EPOCH FROM (NOW() - MAX(te.timestamp))) / 3600 AS horas_sem_update
+            EXTRACT(EPOCH FROM (NOW() - MAX(te.timestamp))) / 3600 AS horas_sem_update,
+            a.tipo AS anomalia_tipo
           FROM tracking_events te
           LEFT JOIN pedidos_mapeamento pm ON te.pedido_id = pm.numero_marketplace
+          LEFT JOIN anomalias a ON te.pedido_id = a.pedido_id AND a.resolvida = false
           ${baseWhere}
-          GROUP BY te.pedido_id, pm.prazo_despacho
+          GROUP BY te.pedido_id, pm.prazo_despacho, a.tipo
         )
         SELECT
-          COUNT(*)                                                        AS total,
-          COUNT(*) FILTER (
-            WHERE (prazo_despacho IS NOT NULL AND prazo_despacho < NOW())
-               OR (prazo_despacho IS NULL AND horas_sem_update > 1)
-          )                                                               AS fora_prazo,
-          COUNT(*) FILTER (
-            WHERE prazo_despacho IS NOT NULL
-              AND prazo_despacho >= NOW()
-              AND prazo_despacho < NOW() + INTERVAL '24 hours'
-          )                                                               AS urgentes,
-          COUNT(*) FILTER (WHERE prazo_despacho IS NULL)                 AS sem_prazo
+          COUNT(*) AS total,
+          COUNT(*) FILTER (WHERE anomalia_tipo = 'NAO_INTEGROU_JET') AS nao_integrou_jet,
+          COUNT(*) FILTER (WHERE anomalia_tipo = 'NAO_ENTROU_ONCLICK') AS nao_entrou_onclick,
+          COUNT(*) FILTER (WHERE anomalia_tipo = 'FATURADO_APOS_ENVIO') AS faturado_apos_envio,
+          COUNT(*) FILTER (WHERE anomalia_tipo = 'ATRASO_ENVIO_PRAZO') AS atraso_envio_prazo,
+          COUNT(*) FILTER (WHERE anomalia_tipo = 'PARADO_SEM_EVOLUCAO') AS parado_sem_evolucao,
+          COUNT(*) FILTER (WHERE anomalia_tipo = 'PROXIMO_PRAZO_ENVIO') AS proximo_prazo_envio,
+          COUNT(*) FILTER (WHERE anomalia_tipo = 'PEDIDO_TRAVADO_JET') AS pedido_travado_jet
         FROM eventos_pedido
         WHERE 1=1
           ${travadosFiltro}
-          ${quickFilterClause}
+          ${anomaliaFilter}
       `;
 
       params.push(parseInt(limit), offset);
 
       const [pedidosResult, countResult] = await Promise.all([
         pool.query(pedidosQuery, params),
-        pool.query(countQuery, params.slice(0, -2)),  // sem limit/offset
+        pool.query(countQuery, params.slice(0, -2)),
       ]);
 
       const totais = countResult.rows[0];
-      const total  = parseInt(totais.total);
+      const total = parseInt(totais.total);
 
       res.json({
         success: true,
@@ -386,13 +378,16 @@ const DashboardController = {
         limit: parseInt(limit),
         total,
         totalPages: Math.ceil(total / parseInt(limit)),
-        // Totais globais do filtro — usados na barra de resumo do frontend
         summary: {
           total,
-          foraPrazo: parseInt(totais.fora_prazo),
-          urgentes:  parseInt(totais.urgentes),
-          semPrazo:  parseInt(totais.sem_prazo),
-        },
+          nao_integrou_jet: parseInt(totais.nao_integrou_jet || 0),
+          nao_entrou_onclick: parseInt(totais.nao_entrou_onclick || 0),
+          faturado_apos_envio: parseInt(totais.faturado_apos_envio || 0),
+          atraso_envio_prazo: parseInt(totais.atraso_envio_prazo || 0),
+          parado_sem_evolucao: parseInt(totais.parado_sem_evolucao || 0),
+          proximo_prazo_envio: parseInt(totais.proximo_prazo_envio || 0),
+          pedido_travado_jet: parseInt(totais.pedido_travado_jet || 0)
+        }
       });
     } catch (error) {
       console.error('Erro getPedidosPipeline:', error);
@@ -450,6 +445,7 @@ const DashboardController = {
               AND status IN ('ENTREGUE', 'CANCELADO', 'CONCLUDED', 'CANCELED')
             )
           GROUP BY pm.marketplace_origem ORDER BY total DESC
+          LIMIT 10
         `),
         pool.query(`
           SELECT 

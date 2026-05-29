@@ -1049,3 +1049,27 @@ body {
   background: linear-gradient(135deg, var(--surface) 0%, var(--stage-color) 100%);
   background-blend-mode: overlay;
 }
+/* Anomalia chips na tabela */
+.anomalia-chip {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 20px;
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.anomalia-urgente {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.anomalia-alta {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.anomalia-media {
+  background: var(--accent-soft);
+  color: var(--accent);
+}

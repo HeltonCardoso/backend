@@ -87,7 +87,7 @@ const SkeletonVolumeChart = () => {
 
 const SkeletonTableRow = () => (
   <tr className="skeleton-row">
-    {[90, 75, 80, 100, 95, 100, 85, 55, 65].map((w, i) => (
+    {[90, 75, 80, 100, 95, 100, 85, 55, 65, 80].map((w, i) => (
       <td key={i}><div className="skeleton" style={{ height: 14, width: w }} /></td>
     ))}
   </tr>
@@ -95,13 +95,13 @@ const SkeletonTableRow = () => (
 
 const SkeletonPipelineSummaryBar = () => (
   <div className="psb-skeleton">
-    {[50, 80, 90, 65].map((w, i) => (
+    {[50, 80, 90, 65, 70, 60, 55].map((w, i) => (
       <React.Fragment key={i}>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, padding: '6px 14px' }}>
           <div className="skeleton" style={{ width: 36, height: 22, borderRadius: 4 }} />
           <div className="skeleton" style={{ width: w, height: 11 }} />
         </div>
-        {i < 3 && <div style={{ width: 1, height: 14, background: 'var(--border)' }} />}
+        {i < 6 && <div style={{ width: 1, height: 14, background: 'var(--border)' }} />}
       </React.Fragment>
     ))}
   </div>
@@ -144,6 +144,7 @@ function App() {
   // ─── Dados ────────────────────────────────────────
   const [dashboardData, setDashboardData] = useState({
     metricas: { ANYMARKET: 0, JET: 0, ONCLICK: 0, RETORNO_JET: 0, RETORNO_ANYMARKET: 0 },
+    anomalias: {},
     anomaliasNaoResolvidas: 0,
     pedidosTravados: 0,
     porEstagio: {},
@@ -153,11 +154,17 @@ function App() {
   });
 
   const [anomalias, setAnomalias] = useState([]);
+  const [anomaliasTotal, setAnomaliasTotal] = useState(0);
+  const [anomaliasPage, setAnomaliasPage] = useState(1);
+  const [anomaliasLimit] = useState(20);
+  const [anomaliasTipoFilter, setAnomaliasTipoFilter] = useState('');
+  
   const [pedidos, setPedidos] = useState([]);
-  const [pipelineSummary, setPipelineSummary] = useState({ total: 0, foraPrazo: 0, urgentes: 0, semPrazo: 0 });
+  const [pipelineSummary, setPipelineSummary] = useState({ total: 0, nao_integrou_jet: 0, nao_entrou_onclick: 0, faturado_apos_envio: 0, atraso_envio_prazo: 0, parado_sem_evolucao: 0, proximo_prazo_envio: 0, pedido_travado_jet: 0 });
   const [graficos, setGraficos] = useState({ porStatus: {}, porMarketplace: [], volumeHoras: [] });
   const [selectedOrder, setSelectedOrder] = useState(null);
   const [filters, setFilters] = useState({ marketplace: '', travados: false, search: '', loja: '', sort: '', quickFilter: '' });
+  const [anomaliaFilter, setAnomaliaFilter] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
   const [notification, setNotification] = useState(null);
@@ -294,12 +301,18 @@ function App() {
   const fetchAnomalias = useCallback(async () => {
     setAnomaliasLoading(true);
     try {
-      const r = await fetch(`${API_URL}/dashboard/anomalias?limit=10`);
+      const offset = (anomaliasPage - 1) * anomaliasLimit;
+      let url = `${API_URL}/dashboard/anomalias?limit=${anomaliasLimit}&offset=${offset}`;
+      if (anomaliasTipoFilter) url += `&tipo=${encodeURIComponent(anomaliasTipoFilter)}`;
+      const r = await fetch(url);
       const d = await r.json();
-      if (d.success) setAnomalias(d.anomalias);
+      if (d.success) {
+        setAnomalias(d.anomalias);
+        setAnomaliasTotal(d.total);
+      }
     } catch {}
     finally { setAnomaliasLoading(false); }
-  }, [API_URL]);
+  }, [API_URL, anomaliasPage, anomaliasLimit, anomaliasTipoFilter]);
 
   const fetchPedidos = useCallback(async () => {
     setLoading(true);
@@ -311,6 +324,7 @@ function App() {
       if (filters.sort)        url += `&sort=${filters.sort}`;
       if (filters.quickFilter) url += `&quickFilter=${filters.quickFilter}`;
       if (filters.search)      url += `&search=${encodeURIComponent(filters.search)}`;
+      if (anomaliaFilter)      url += `&anomaliaTipo=${encodeURIComponent(anomaliaFilter)}`;
       const r = await fetch(url);
       const d = await r.json();
       if (d.success) {
@@ -320,7 +334,7 @@ function App() {
       }
     } catch {}
     finally { setLoading(false); }
-  }, [API_URL, currentPage, filters]);
+  }, [API_URL, currentPage, filters, anomaliaFilter]);
 
   const fetchGraficos = useCallback(async () => {
     setGraficosLoading(true);
@@ -396,8 +410,9 @@ function App() {
 
   // ─── Initial load ─────────────────────────────────
   useEffect(() => { refreshAll(); }, []);
-  useEffect(() => { setCurrentPage(1); fetchPedidos(); }, [filters]);
+  useEffect(() => { setCurrentPage(1); fetchPedidos(); }, [filters, anomaliaFilter]);
   useEffect(() => { fetchPedidos(); }, [currentPage]);
+  useEffect(() => { fetchAnomalias(); }, [anomaliasPage, anomaliasTipoFilter]);
 
   // ─── Auto-refresh ─────────────────────────────────
   useEffect(() => {
@@ -433,7 +448,7 @@ function App() {
   };
 
   // ═══════════════════════════════════════════════════════════════
-  // FUNÇÕES CORRIGIDAS PARA O FLUXO CORRETO DO PIPELINE
+  // FUNÇÕES PARA O FLUXO DO PIPELINE
   // ═══════════════════════════════════════════════════════════════
   
   const traduzirOrigem = (origem) => {
@@ -449,11 +464,11 @@ function App() {
 
   const getOrigemColor = (origem) => {
     const colors = {
-      'ANYMARKET': '#3b82f6',        // Azul - Início
-      'JET': '#06b6d4',              // Ciano - Integração
-      'ONCLICK': '#f59e0b',          // Âmbar - Processamento
-      'RETORNO_JET': '#10b981',      // Verde - Confirmação
-      'RETORNO_ANYMARKET': '#8b5cf6' // Roxo - Conclusão
+      'ANYMARKET': '#3b82f6',
+      'JET': '#06b6d4',
+      'ONCLICK': '#f59e0b',
+      'RETORNO_JET': '#10b981',
+      'RETORNO_ANYMARKET': '#8b5cf6'
     };
     return colors[origem] || '#6b7280';
   };
@@ -469,7 +484,6 @@ function App() {
     return descriptions[stage] || '';
   };
 
-  // Ordem correta do pipeline (fluxo real)
   const pipelineStages = [
     { key: 'ANYMARKET',         icon: '◉', label: 'Anymarket',        ordem: 1, description: 'Pedido recebido' },
     { key: 'JET',               icon: '⬡', label: 'JET',              ordem: 2, description: 'Integração JET' },
@@ -496,10 +510,11 @@ function App() {
     { id: 'anomalias', icon: '⚠', label: 'Anomalias', badge: dashboardData.anomaliasNaoResolvidas },
     { id: 'graficos',  icon: '▦', label: 'Gráficos' },
     { id: 'upload',    icon: '📤', label: 'Upload Planilha' },
-    { id: 'meli', icon: '🛒', label: 'Mercado Livre' },
+    { id: 'meli',      icon: '🛒', label: 'Mercado Livre' },
   ];
 
   const maxVolume = Math.max(...(graficos.volumeHoras?.map(h => h.total) || [1]), 1);
+  const anomaliasTotalPages = Math.ceil(anomaliasTotal / anomaliasLimit);
 
   // ─── Se NÃO autenticado ───────────────────────────
   if (!isAuthenticated) {
@@ -703,8 +718,6 @@ function App() {
           {/* ══════════════ OVERVIEW ══════════════ */}
           {activeSection === 'overview' && (
             <div className="section-overview">
-
-              {/* KPIs */}
               <div className="kpi-strip">
                 {initialLoading ? (
                   [1, 2, 3, 4].map(i => <SkeletonKpi key={i} />)
@@ -727,7 +740,7 @@ function App() {
                       </div>
                       <div className="kpi-content">
                         <span className="kpi-value">{dashboardData.pedidosTravados}</span>
-                        <span className="kpi-label">Travados (+1h)</span>
+                        <span className="kpi-label">Travados</span>
                       </div>
                       {dashboardData.pedidosTravados > 0 && <div className="kpi-trend down">⚠</div>}
                     </div>
@@ -759,7 +772,7 @@ function App() {
                 )}
               </div>
 
-              {/* Pipeline Flow - CORRIGIDO COM A ORDEM CERTA */}
+              {/* Pipeline Flow */}
               <div className="panel">
                 <div className="panel-header">
                   <h2 className="panel-title">Pipeline em Tempo Real</h2>
@@ -894,57 +907,71 @@ function App() {
                 <button onClick={() => setFilters({ marketplace: '', travados: false, search: '', loja: '', sort: '', quickFilter: '' })} className="clear-btn">Limpar</button>
               </div>
 
-              {/* Contadores clicáveis */}
-              {loading && pedidos.length === 0 ? <SkeletonPipelineSummaryBar /> : (
+              {/* Contadores clicáveis por anomalia */}
+              {!loading && dashboardData.anomalias && (
                 <div className="pipeline-summary-bar">
                   <button
-                    className={`psb-btn ${!filters.quickFilter && !filters.travados ? 'psb-btn-active' : ''}`}
-                    onClick={() => setFilters(f => ({ ...f, quickFilter: '', travados: false }))}
-                    title="Ver todos os pedidos"
+                    className={`psb-btn ${anomaliaFilter === '' ? 'psb-btn-active' : ''}`}
+                    onClick={() => setAnomaliaFilter('')}
+                    title="Todos os pedidos"
                   >
                     <strong>{pipelineSummary.total}</strong>
                     <span>total</span>
                   </button>
                   <span className="psb-divider" />
+                  
                   <button
-                    className={`psb-btn psb-danger ${filters.quickFilter === 'foraPrazo' ? 'psb-btn-active' : ''}`}
-                    onClick={() => setFilters(f => ({
-                      ...f,
-                      quickFilter: f.quickFilter === 'foraPrazo' ? '' : 'foraPrazo',
-                      travados:    false,
-                      sort:        f.quickFilter === 'foraPrazo' ? f.sort : 'prazo_desc',
-                    }))}
-                    title="Filtrar pedidos fora do prazo"
+                    className={`psb-btn psb-danger ${anomaliaFilter === 'NAO_INTEGROU_JET' ? 'psb-btn-active' : ''}`}
+                    onClick={() => setAnomaliaFilter(anomaliaFilter === 'NAO_INTEGROU_JET' ? '' : 'NAO_INTEGROU_JET')}
+                    title="Pedidos que não chegaram na JET"
                   >
-                    <strong>{pipelineSummary.foraPrazo}</strong>
-                    <span>fora do prazo</span>
+                    <strong>{dashboardData.anomalias?.nao_integrou_jet || 0}</strong>
+                    <span>não chegou JET</span>
                   </button>
-                  <span className="psb-divider" />
+                  
                   <button
-                    className={`psb-btn psb-warning ${filters.quickFilter === 'urgentes' ? 'psb-btn-active' : ''}`}
-                    onClick={() => setFilters(f => ({
-                      ...f,
-                      quickFilter: f.quickFilter === 'urgentes' ? '' : 'urgentes',
-                      travados:    false,
-                      sort:        f.quickFilter === 'urgentes' ? f.sort : 'prazo_asc',
-                    }))}
-                    title="Filtrar pedidos que vencem nas próximas 24h"
+                    className={`psb-btn psb-danger ${anomaliaFilter === 'NAO_ENTROU_ONCLICK' ? 'psb-btn-active' : ''}`}
+                    onClick={() => setAnomaliaFilter(anomaliaFilter === 'NAO_ENTROU_ONCLICK' ? '' : 'NAO_ENTROU_ONCLICK')}
+                    title="Pedidos que não entraram no ERP"
                   >
-                    <strong>{pipelineSummary.urgentes}</strong>
-                    <span>vencem em &lt;24h</span>
+                    <strong>{dashboardData.anomalias?.nao_entrou_onclick || 0}</strong>
+                    <span>não entrou ERP</span>
                   </button>
-                  <span className="psb-divider" />
+                  
                   <button
-                    className={`psb-btn psb-muted ${filters.quickFilter === 'semPrazo' ? 'psb-btn-active' : ''}`}
-                    onClick={() => setFilters(f => ({
-                      ...f,
-                      quickFilter: f.quickFilter === 'semPrazo' ? '' : 'semPrazo',
-                      travados:    false,
-                    }))}
-                    title="Filtrar pedidos sem prazo cadastrado"
+                    className={`psb-btn psb-warning ${anomaliaFilter === 'FATURADO_APOS_ENVIO' ? 'psb-btn-active' : ''}`}
+                    onClick={() => setAnomaliaFilter(anomaliaFilter === 'FATURADO_APOS_ENVIO' ? '' : 'FATURADO_APOS_ENVIO')}
+                    title="Pedidos faturados após envio"
                   >
-                    <strong>{pipelineSummary.semPrazo}</strong>
-                    <span>sem prazo</span>
+                    <strong>{dashboardData.anomalias?.faturado_apos_envio || 0}</strong>
+                    <span>faturado após envio</span>
+                  </button>
+                  
+                  <button
+                    className={`psb-btn psb-warning ${anomaliaFilter === 'ATRASO_ENVIO_PRAZO' ? 'psb-btn-active' : ''}`}
+                    onClick={() => setAnomaliaFilter(anomaliaFilter === 'ATRASO_ENVIO_PRAZO' ? '' : 'ATRASO_ENVIO_PRAZO')}
+                    title="Pedidos com atraso no prazo"
+                  >
+                    <strong>{dashboardData.anomalias?.atraso_envio_prazo || 0}</strong>
+                    <span>atraso prazo</span>
+                  </button>
+                  
+                  <button
+                    className={`psb-btn psb-muted ${anomaliaFilter === 'PARADO_SEM_EVOLUCAO' ? 'psb-btn-active' : ''}`}
+                    onClick={() => setAnomaliaFilter(anomaliaFilter === 'PARADO_SEM_EVOLUCAO' ? '' : 'PARADO_SEM_EVOLUCAO')}
+                    title="Pedidos parados sem evolução"
+                  >
+                    <strong>{dashboardData.anomalias?.parado_sem_evolucao || 0}</strong>
+                    <span>parado sem evolução</span>
+                  </button>
+                  
+                  <button
+                    className={`psb-btn psb-muted ${anomaliaFilter === 'PEDIDO_TRAVADO_JET' ? 'psb-btn-active' : ''}`}
+                    onClick={() => setAnomaliaFilter(anomaliaFilter === 'PEDIDO_TRAVADO_JET' ? '' : 'PEDIDO_TRAVADO_JET')}
+                    title="Pedidos travados na JET"
+                  >
+                    <strong>{dashboardData.anomalias?.pedido_travado_jet || 0}</strong>
+                    <span>travado JET</span>
                   </button>
                 </div>
               )}
@@ -956,44 +983,19 @@ function App() {
                       <th>Nº Pedido</th>
                       <th>Marketplace</th>
                       <th>Loja</th>
-                      <th>IDs do Sistema</th>
-                      <th>Estágio Atual</th>
+                      <th>IDs</th>
+                      <th>Estágio</th>
                       <th>Último Evento</th>
-                      <th
-                        className={`th-sortable ${filters.sort.startsWith('prazo') ? 'th-active' : ''}`}
-                        onClick={() => setFilters(f => ({ ...f, sort: f.sort === 'prazo_asc' ? 'prazo_desc' : 'prazo_asc' }))}
-                        title="Clique para ordenar por prazo"
-                      >
-                        Prazo Prometido
-                        <span className="th-sort-icon">
-                          {filters.sort === 'prazo_asc' ? ' ↑' : filters.sort === 'prazo_desc' ? ' ↓' : ' ⇅'}
-                        </span>
-                      </th>
-                      <th
-                        className={`th-sortable ${filters.sort === 'parado_desc' ? 'th-active' : ''}`}
-                        onClick={() => setFilters(f => ({ ...f, sort: f.sort === 'parado_desc' ? '' : 'parado_desc' }))}
-                        title="Clique para ordenar por tempo parado"
-                      >
-                        Parado há
-                        <span className="th-sort-icon">
-                          {filters.sort === 'parado_desc' ? ' ↓' : ' ⇅'}
-                        </span>
-                      </th>
+                      <th>Prazo</th>
+                      <th>Anomalia</th>
                       <th></th>
                     </tr>
                   </thead>
                   <tbody>
                     {loading ? (
-                      [1, 2, 3, 4, 5, 6, 7, 8].map(i => <SkeletonTableRow key={i} />)
+                      [1,2,3,4,5,6,7,8].map(i => <SkeletonTableRow key={i} />)
                     ) : filteredPedidos.length === 0 ? (
-                      <tr>
-                        <td colSpan="9">
-                          <div className="empty-table">
-                            <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2M9 5a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2M9 5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2"/></svg>
-                            <p>Nenhum pedido encontrado</p>
-                          </div>
-                        </td>
-                      </tr>
+                      <tr><td colSpan="9"><div className="empty-table">Nenhum pedido encontrado</div></td></tr>
                     ) : (
                       filteredPedidos.map((pedido) => {
                         const travado   = isPedidoTravado(pedido);
@@ -1006,29 +1008,16 @@ function App() {
                             <td>
                               <div className="ids-stack">
                                 {pedido.id_anymarket && <span><span className="id-prefix am">AM</span>{pedido.id_anymarket}</span>}
-                                {pedido.id_jet       && <span><span className="id-prefix jet">JET</span>{pedido.id_jet}</span>}
-                                {pedido.id_onclick   && <span><span className="id-prefix oc">OC</span>{pedido.id_onclick}</span>}
+                                {pedido.id_jet && <span><span className="id-prefix jet">JET</span>{pedido.id_jet}</span>}
                               </div>
                             </td>
                             <td>
                               <div className="stage-chips">
-                                {pedido.origens?.map(orig => {
-                                  const stageInfo = pipelineStages.find(s => s.key === orig);
-                                  return (
-                                    <span 
-                                      key={orig} 
-                                      className="stage-chip" 
-                                      style={{ 
-                                        background: getOrigemColor(orig) + '22', 
-                                        color: getOrigemColor(orig), 
-                                        borderColor: getOrigemColor(orig) + '44' 
-                                      }}
-                                      title={stageInfo?.description || ''}
-                                    >
-                                      {traduzirOrigem(orig)}
-                                    </span>
-                                  );
-                                })}
+                                {pedido.origens?.map(orig => (
+                                  <span key={orig} className="stage-chip" style={{ background: getOrigemColor(orig) + '22', color: getOrigemColor(orig) }}>
+                                    {traduzirOrigem(orig)}
+                                  </span>
+                                ))}
                               </div>
                             </td>
                             <td className="date-cell">{formatDate(pedido.ultimo_evento)}</td>
@@ -1036,28 +1025,24 @@ function App() {
                               {prazoInfo ? (
                                 <div className="prazo-cell">
                                   <span className={`prazo-badge ${prazoInfo.atrasado ? 'prazo-atrasado' : (parseFloat(pedido.horas_ate_prazo) < 24 ? 'prazo-urgente' : 'prazo-ok')}`}>
-                                    {prazoInfo.atrasado
-                                      ? `⚠ Atrasado ${prazoInfo.label}`
-                                      : parseFloat(pedido.horas_ate_prazo) < 24
-                                        ? `⚡ ${prazoInfo.label} restantes`
-                                        : `✓ ${prazoInfo.label} restantes`
-                                    }
+                                    {prazoInfo.atrasado ? `⚠ Atrasado ${prazoInfo.label}` : `✓ ${prazoInfo.label} restantes`}
                                   </span>
-                                  {pedido.prazo_despacho && (
-                                    <span className="prazo-data">{new Date(pedido.prazo_despacho).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
-                                  )}
                                 </div>
-                              ) : (
-                                <span className="prazo-badge prazo-sem">Sem prazo</span>
+                              ) : <span className="prazo-badge prazo-sem">Sem prazo</span>}
+                            </td>
+                            <td>
+                              {pedido.anomalia_tipo && (
+                                <span className={`anomalia-chip ${
+                                  ['ATRASO_ENVIO_PRAZO', 'PEDIDO_TRAVADO_JET'].includes(pedido.anomalia_tipo) ? 'anomalia-urgente' :
+                                  ['NAO_INTEGROU_JET', 'NAO_ENTROU_ONCLICK', 'PARADO_SEM_EVOLUCAO'].includes(pedido.anomalia_tipo) ? 'anomalia-alta' :
+                                  'anomalia-media'
+                                }`}>
+                                  {pedido.anomalia_tipo.replace(/_/g, ' ')}
+                                </span>
                               )}
                             </td>
                             <td>
-                              <span className={`hours-badge ${travado ? 'hours-danger' : 'hours-ok'}`}>
-                                {parseFloat(pedido.horas_sem_update || 0).toFixed(1)}h
-                              </span>
-                            </td>
-                            <td>
-                              <button className="detail-btn" onClick={() => fetchPedidoDetalhes(pedido.pedido_id)}>Ver detalhes</button>
+                              <button className="detail-btn" onClick={() => fetchPedidoDetalhes(pedido.pedido_id)}>Ver</button>
                             </td>
                           </tr>
                         );
@@ -1069,9 +1054,9 @@ function App() {
                 {totalPages > 1 && (
                   <div className="pagination">
                     <button className="page-btn" onClick={() => setCurrentPage(1)} disabled={currentPage === 1}>«</button>
-                    <button className="page-btn" onClick={() => setCurrentPage(p => Math.max(1, p - 1))} disabled={currentPage === 1}>‹</button>
+                    <button className="page-btn" onClick={() => setCurrentPage(p => Math.max(1, p-1))} disabled={currentPage === 1}>‹</button>
                     <span className="page-info">Página <strong>{currentPage}</strong> de <strong>{totalPages}</strong></span>
-                    <button className="page-btn" onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))} disabled={currentPage === totalPages}>›</button>
+                    <button className="page-btn" onClick={() => setCurrentPage(p => Math.min(totalPages, p+1))} disabled={currentPage === totalPages}>›</button>
                     <button className="page-btn" onClick={() => setCurrentPage(totalPages)} disabled={currentPage === totalPages}>»</button>
                   </div>
                 )}
@@ -1103,11 +1088,29 @@ function App() {
                     <div className="ak-label">Resolvidas</div>
                   </div>
                 </div>
+                <div className="anomalia-kpi" style={{ flex: 1 }}>
+                  <div className="ak-icon">🏷️</div>
+                  <div>
+                    <select
+                      value={anomaliasTipoFilter}
+                      onChange={(e) => { setAnomaliasTipoFilter(e.target.value); setAnomaliasPage(1); }}
+                      style={{ padding: '6px 10px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border)', background: 'var(--surface)' }}
+                    >
+                      <option value="">Todos os tipos</option>
+                      <option value="NAO_INTEGROU_JET">Não integrou JET</option>
+                      <option value="NAO_ENTROU_ONCLICK">Não entrou ONCLICK</option>
+                      <option value="FATURADO_APOS_ENVIO">Faturado após envio</option>
+                      <option value="ATRASO_ENVIO_PRAZO">Atraso prazo</option>
+                      <option value="PARADO_SEM_EVOLUCAO">Parado sem evolução</option>
+                      <option value="PEDIDO_TRAVADO_JET">Travado JET</option>
+                    </select>
+                  </div>
+                </div>
               </div>
 
               <div className="anomalias-cards">
                 {anomaliasLoading ? (
-                  [1, 2, 3, 4].map(i => <SkeletonAnomaliaCard key={i} />)
+                  [1,2,3,4].map(i => <SkeletonAnomaliaCard key={i} />)
                 ) : anomalias.length === 0 ? (
                   <div className="empty-section">
                     <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
@@ -1140,14 +1143,27 @@ function App() {
                   ))
                 )}
               </div>
+
+              {/* Paginação anomalias */}
+              {anomaliasTotalPages > 1 && (
+                <div className="pagination" style={{ marginTop: 16 }}>
+                  <button className="page-btn" onClick={() => setAnomaliasPage(1)} disabled={anomaliasPage === 1}>«</button>
+                  <button className="page-btn" onClick={() => setAnomaliasPage(p => Math.max(1, p-1))} disabled={anomaliasPage === 1}>‹</button>
+                  <span className="page-info">Página <strong>{anomaliasPage}</strong> de <strong>{anomaliasTotalPages}</strong></span>
+                  <button className="page-btn" onClick={() => setAnomaliasPage(p => Math.min(anomaliasTotalPages, p+1))} disabled={anomaliasPage === anomaliasTotalPages}>›</button>
+                  <button className="page-btn" onClick={() => setAnomaliasPage(anomaliasTotalPages)} disabled={anomaliasPage === anomaliasTotalPages}>»</button>
+                </div>
+              )}
             </div>
           )}
+
           {/* ══════════════ MERCADO LIVRE ══════════════ */}
           {activeSection === 'meli' && (
-              <div className="section-meli">
-                  <MercadoLivreConnection />
-              </div>
+            <div className="section-meli">
+              <MercadoLivreConnection />
+            </div>
           )}
+
           {/* ══════════════ GRÁFICOS ══════════════ */}
           {activeSection === 'graficos' && (
             <div className="section-graficos">
@@ -1188,7 +1204,6 @@ function App() {
                           </div>
                         );
                       })}
-                      {!(graficos.porMarketplace?.length) && <p className="empty-state">Sem dados disponíveis</p>}
                     </div>
                   )}
                 </div>
@@ -1251,9 +1266,6 @@ function App() {
                   <span className="info-label">Prazo Prometido</span>
                   <span className={`info-value ${selectedOrder.mapeamento?.prazo_despacho && new Date(selectedOrder.mapeamento.prazo_despacho) < new Date() ? 'info-value-danger' : ''}`}>
                     {selectedOrder.mapeamento?.prazo_despacho ? formatDate(selectedOrder.mapeamento.prazo_despacho) : '—'}
-                    {selectedOrder.mapeamento?.prazo_despacho && new Date(selectedOrder.mapeamento.prazo_despacho) < new Date() &&
-                      <span style={{ marginLeft: 6, fontSize: 11, fontWeight: 700, color: 'var(--danger)' }}>VENCIDO</span>
-                    }
                   </span>
                 </div>
                 <div className="info-block">

@@ -24,7 +24,7 @@ const TIPOS_ANOMALIA = {
   ENVIADO_SEM_PRODUCAO: { descricao: 'JET enviou sem confirmação de produção', severidade: 'MEDIUM' },
   PROXIMO_PRAZO_ENVIO: { descricao: 'Pedido próximo do prazo de despacho do marketplace', severidade: 'WARNING' },
   ATRASO_ENVIO_PRAZO: { descricao: 'Pedido ULTRAPASSOU o prazo de despacho do marketplace', severidade: 'URGENTE' },
-  TRAVADO_SEM_ATUALIZACAO: { descricao: 'Pedido sem atualização por mais de 2 horas', severidade: 'HIGH' },
+  PARADO_SEM_EVOLUCAO: { descricao: 'Pedido sem atualização há mais tempo que o prazo de preparação', severidade: 'HIGH' },
   RETORNO_JET_SEM_CONFIRMACAO_ANYMARKET: { descricao: 'JET enviou mas AnyMarket não confirmou', severidade: 'HIGH' },
   ONCLICK_FATUROU_SEM_RETORNO_JET: { descricao: 'ONCLICK faturou mas JET não confirmou envio', severidade: 'HIGH' },
   ATRASO_PRAZO_PREPARACAO: { descricao: 'Pedido NÃO foi despachado dentro do prazo de preparação (deliveryTime)', severidade: 'URGENTE' },
@@ -88,7 +88,7 @@ async function createAnomaly(pedido_id, tipo, origem_falha, marketplace, metadat
       return;
     }
 
-    // ⭐ NÃO envia UUID - deixa o banco gerar o ID automaticamente (SERIAL/BIGSERIAL)
+    // ⭐ NÃO envia UUID - deixa o banco gerar o ID automaticamente
     const result = await pool.query(
       `INSERT INTO anomalias (pedido_id, tipo, origem_falha, marketplace, detalhes, criado_em, resolvida)
        VALUES ($1, $2, $3, $4, $5, NOW(), false)
@@ -118,31 +118,56 @@ async function createAnomaly(pedido_id, tipo, origem_falha, marketplace, metadat
   }
 }
 
+// ⭐ FUNÇÃO PARA BUSCAR PRAZO DE PREPARAÇÃO DO PEDIDO
+async function getPrazoPreparacao(pedido_id) {
+  try {
+    const result = await pool.query(`
+      SELECT delivery_time_jet, prazo_preparacao_horas
+      FROM pedidos_mapeamento
+      WHERE numero_marketplace = $1
+    `, [pedido_id]);
+    
+    if (!result.rows.length) return null;
+    
+    const deliveryTimeDias = result.rows[0].delivery_time_jet;
+    if (deliveryTimeDias === null) return null;
+    
+    const prazoPreparacaoHoras = result.rows[0].prazo_preparacao_horas || (deliveryTimeDias === 0 ? 24 : deliveryTimeDias * 24);
+    
+    return {
+      deliveryTimeDias,
+      prazoPreparacaoHoras
+    };
+  } catch (error) {
+    console.error('❌ Erro ao buscar prazo de preparação:', error.message);
+    return null;
+  }
+}
+
 // ⭐ FUNÇÃO CORRIGIDA - VERIFICAR PRAZO DE PREPARAÇÃO
 async function verificarPrazoPreparacao(pedido_id, marketplace) {
   try {
     const pedidoIdStr = String(pedido_id);
     
-    const result = await pool.query(`
-      SELECT delivery_time_jet, prazo_preparacao_horas, criado_em
-      FROM pedidos_mapeamento
-      WHERE numero_marketplace = $1
-    `, [pedidoIdStr]);
-
-    if (!result.rows.length) return;
-
-    const deliveryTimeDias = result.rows[0].delivery_time_jet ?? null;
-    let prazoPreparacaoHoras = result.rows[0].prazo_preparacao_horas;
-    const dataCriacao = result.rows[0].criado_em;
-
-    if (deliveryTimeDias === null) {
+    const prazoInfo = await getPrazoPreparacao(pedidoIdStr);
+    if (!prazoInfo) {
       console.log(`   ⚠️ Sem deliveryTime da JET para este pedido`);
       return;
     }
-
-    const dataCriacaoDate = new Date(dataCriacao);
+    
+    const { deliveryTimeDias, prazoPreparacaoHoras } = prazoInfo;
+    
+    // Buscar data de criação do pedido no sistema
+    const criacaoResult = await pool.query(`
+      SELECT criado_em FROM pedidos_mapeamento
+      WHERE numero_marketplace = $1
+    `, [pedidoIdStr]);
+    
+    if (!criacaoResult.rows.length) return;
+    
+    const dataCriacao = new Date(criacaoResult.rows[0].criado_em);
     const agora = new Date();
-    const horasDecorridas = (agora.getTime() - dataCriacaoDate.getTime()) / (1000 * 60 * 60);
+    const horasDecorridas = (agora.getTime() - dataCriacao.getTime()) / (1000 * 60 * 60);
     
     console.log(`   📦 DeliveryTime JET: ${deliveryTimeDias} dias ${deliveryTimeDias === 0 ? '(pronta entrega)' : ''}`);
     console.log(`   ⏰ Prazo preparação: ${prazoPreparacaoHoras}h`);
@@ -197,10 +222,22 @@ async function verificarPrazoPreparacao(pedido_id, marketplace) {
   }
 }
 
-// ⭐ FUNÇÃO CORRIGIDA - ANALISAR TEMPOS DE PRODUÇÃO
+// ⭐ FUNÇÃO CORRIGIDA - ANALISAR TEMPOS DE PRODUÇÃO (com verificação de envio)
 async function analisarTemposProducao(pedido_id, marketplace) {
   try {
     const pedidoIdStr = String(pedido_id);
+    
+    // ⭐ VERIFICAR SE PEDIDO JÁ FOI ENVIADO
+    const enviado = await pool.query(`
+      SELECT id FROM tracking_events 
+      WHERE pedido_id = $1 AND origem = 'RETORNO_JET'
+      LIMIT 1
+    `, [pedidoIdStr]);
+
+    if (enviado.rows.length) {
+      console.log(`   ✅ Pedido já foi enviado, ignorando verificação de produção`);
+      return;
+    }
     
     const jetEvent = await pool.query(`
       SELECT dados_completos
@@ -388,21 +425,34 @@ async function checkPipelineStatus(pedido_id) {
       }
     }
 
-    // 3. VERIFICAÇÃO: Pedido TRAVADO (sem atualização > 2h)
+    // 3. VERIFICAÇÃO: Pedido TRAVADO (considerando deliveryTime)
     const ultimoEventoGeral = events.rows.reduce((latest, current) => {
       return new Date(current.ultimo_evento) > new Date(latest.ultimo_evento) ? current : latest;
     }, events.rows[0]);
 
-    if (ultimoEventoGeral) {
+    if (ultimoEventoGeral && !statusFinais.includes(statusAtual)) {
+      // ⭐ Buscar prazo de preparação do pedido
+      const prazoPreparacao = await getPrazoPreparacao(pedidoIdStr);
+      let limiteTravadoHoras = 48; // fallback padrão (2 dias)
+      
+      if (prazoPreparacao) {
+        // Usa o prazo de preparação real
+        limiteTravadoHoras = prazoPreparacao.prazoPreparacaoHoras;
+      }
+      
       const horasSemUpdate = (agora.getTime() - new Date(ultimoEventoGeral.ultimo_evento).getTime()) / (1000 * 60 * 60);
-      const limiteTravado = 2;
-
-      if (horasSemUpdate > limiteTravado && !statusFinais.includes(statusAtual)) {
-        await createAnomaly(pedidoIdStr, 'TRAVADO_SEM_ATUALIZACAO', ultimoEventoGeral.origem, marketplace, {
-          detalhes: `Pedido sem atualização há ${horasSemUpdate.toFixed(1)} horas`,
+      
+      // Verificar se já foi enviado
+      const temEnvio = origens.includes('RETORNO_JET') || origens.includes('ENVIADO');
+      
+      // ⭐ Só considera travado se passou do prazo de preparação E não foi enviado
+      if (horasSemUpdate > limiteTravadoHoras && !temEnvio) {
+        await createAnomaly(pedidoIdStr, 'PARADO_SEM_EVOLUCAO', ultimoEventoGeral.origem, marketplace, {
+          detalhes: `Pedido sem atualização há ${horasSemUpdate.toFixed(1)}h (prazo preparação: ${limiteTravadoHoras}h)`,
           ultimo_status: ultimoEventoGeral.status,
           ultima_origem: ultimoEventoGeral.origem,
-          horas_parado: horasSemUpdate.toFixed(1)
+          horas_parado: horasSemUpdate.toFixed(1),
+          prazo_preparacao_horas: limiteTravadoHoras
         });
       }
     }
@@ -496,6 +546,7 @@ module.exports = {
   checkPipelineStatus,
   calcularPrazoDespacho,
   formatarHoras,
+  getPrazoPreparacao,
   verificarPrazoPreparacao,
   analisarTemposProducao,
   SLA_ENTRE_ESTAGIOS,

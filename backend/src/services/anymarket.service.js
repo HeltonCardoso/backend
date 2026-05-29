@@ -38,7 +38,31 @@ const isDuplicate = (key) => {
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 3. BUSCAR DADOS COMPLETOS NA API
+// 3. FUNÇÃO PARA CALCULAR SLA
+// ──────────────────────────────────────────────────────────────────────────────
+function calcularSLA(createdAt) {
+  if (!createdAt) return { sla: 'ok', horas: 0 };
+  
+  const createdDate = new Date(createdAt);
+  const agora = new Date();
+  const horasDecorridas = (agora - createdDate) / (1000 * 60 * 60);
+  
+  // Configuração dos limites (você pode ajustar)
+  const WARNING_HOURS = process.env.SLA_WARNING_HOURS ? parseFloat(process.env.SLA_WARNING_HOURS) : 36;
+  const CRITICAL_HOURS = process.env.SLA_CRITICAL_HOURS ? parseFloat(process.env.SLA_CRITICAL_HOURS) : 48;
+  
+  let sla = 'ok';
+  if (horasDecorridas >= CRITICAL_HOURS) {
+    sla = 'critical';
+  } else if (horasDecorridas >= WARNING_HOURS) {
+    sla = 'warning';
+  }
+  
+  return { sla, horas: horasDecorridas };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 4. BUSCAR DADOS COMPLETOS NA API
 // ──────────────────────────────────────────────────────────────────────────────
 async function buscarDetalhesPedido(pedidoId) {
   try {
@@ -64,7 +88,7 @@ async function buscarDetalhesPedido(pedidoId) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 4. EXTRAIR INFORMAÇÕES RELEVANTES
+// 5. EXTRAIR INFORMAÇÕES RELEVANTES
 // ──────────────────────────────────────────────────────────────────────────────
 function extrairInfoRelevante(dados) {
   if (!dados) return null;
@@ -77,6 +101,7 @@ function extrairInfoRelevante(dados) {
       marketplace: dados.marketPlace,
       status: dados.status || 'DESCONHECIDO',
       status_marketplace: dados.marketPlaceStatus || 'DESCONHECIDO',
+      created_at: dados.createdAt || dados.created_at || new Date().toISOString(),
       // ME2 detection (Mercado Livre)
       produtos: (dados.items || []).map(item => ({
         shippingtype: item.shippings?.[0]?.shippingtype || ''
@@ -89,7 +114,7 @@ function extrairInfoRelevante(dados) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 5. FUNÇÃO PRINCIPAL - PROCESSAR WEBHOOK
+// 6. FUNÇÃO PRINCIPAL - PROCESSAR WEBHOOK
 // ──────────────────────────────────────────────────────────────────────────────
 async function processWebhook(payload) {
   try {
@@ -131,12 +156,17 @@ async function processWebhook(payload) {
     }
 
     const numeroMarketplace = infoEssencial.numero_marketplace;
+    const createdAt = infoEssencial.created_at;
+
+    // 3️⃣ CALCULAR SLA
+    const { sla: slaStatus, horas: horasDecorridas } = calcularSLA(createdAt);
 
     console.log(`✅ Marketplace ID obtido: ${numeroMarketplace}`);
     console.log(`🏪 Marketplace: ${infoEssencial.marketplace}`);
     console.log(`📊 Status: ${event} → ${STATUS_MAP[event] || event}`);
+    console.log(`⏱️ SLA: ${slaStatus} | Tempo decorrido: ${horasDecorridas.toFixed(1)}h`);
 
-    // 3️⃣ SALVAR MAPEAMENTO
+    // 4️⃣ SALVAR MAPEAMENTO
     await pool.query(
       `INSERT INTO pedidos_mapeamento 
        (id_anymarket, numero_marketplace, marketplace_origem, criado_em, atualizado_em)
@@ -148,18 +178,20 @@ async function processWebhook(payload) {
       [idAnyMarket, numeroMarketplace, infoEssencial.marketplace]
     );
 
-    // 4️⃣ NORMALIZAR STATUS
+    // 5️⃣ NORMALIZAR STATUS
     const normalizedStatus = STATUS_MAP[event] || event;
 
-    // 5️⃣ SALVAR TRACKING (com JSON COMPLETO!)
+    // 6️⃣ SALVAR TRACKING (com JSON COMPLETO e SLA!)
     await pool.query(
       `INSERT INTO tracking_events 
-       (id, pedido_id, origem, status, timestamp, payload, dados_completos, criado_em) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       (id, pedido_id, origem, status, timestamp, payload, dados_completos, criado_em, sla_calculado, tempo_decorrido_horas) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9)
        ON CONFLICT (pedido_id, origem, status) DO UPDATE SET
          timestamp = EXCLUDED.timestamp,
          payload = EXCLUDED.payload,
-         dados_completos = EXCLUDED.dados_completos`,
+         dados_completos = EXCLUDED.dados_completos,
+         sla_calculado = EXCLUDED.sla_calculado,
+         tempo_decorrido_horas = EXCLUDED.tempo_decorrido_horas`,
       [
         uuidv4(),
         numeroMarketplace,
@@ -167,21 +199,25 @@ async function processWebhook(payload) {
         normalizedStatus,
         new Date(),
         JSON.stringify(payload),
-        JSON.stringify(jsonCompleto)
+        JSON.stringify(jsonCompleto),
+        slaStatus,
+        horasDecorridas
       ]
     );
 
     console.log(`✅ ANYMARKET ${numeroMarketplace} salvo com status ${normalizedStatus}`);
 
-    // 6️⃣ PAID_WAITING_DELIVERY = AnyMarket confirmou envio
+    // 7️⃣ PAID_WAITING_DELIVERY = AnyMarket confirmou envio
     if (event === 'PAID_WAITING_DELIVERY') {
       await pool.query(
         `INSERT INTO tracking_events 
-         (id, pedido_id, origem, status, timestamp, payload, dados_completos, criado_em) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+         (id, pedido_id, origem, status, timestamp, payload, dados_completos, criado_em, sla_calculado, tempo_decorrido_horas) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9)
          ON CONFLICT (pedido_id, origem, status) DO UPDATE SET
            timestamp = EXCLUDED.timestamp,
-           payload = EXCLUDED.payload`,
+           payload = EXCLUDED.payload,
+           sla_calculado = EXCLUDED.sla_calculado,
+           tempo_decorrido_horas = EXCLUDED.tempo_decorrido_horas`,
         [
           uuidv4(),
           numeroMarketplace,
@@ -189,13 +225,15 @@ async function processWebhook(payload) {
           'ENVIADO',
           new Date(),
           JSON.stringify(payload),
-          JSON.stringify(jsonCompleto)
+          JSON.stringify(jsonCompleto),
+          slaStatus,
+          horasDecorridas
         ]
       );
       console.log(`↩️ [RETORNO_ANYMARKET] Pedido ${numeroMarketplace} confirmado como enviado`);
     }
 
-    // 7️⃣ VERIFICAR ANOMALIA: FATURADO_APOS_ENVIO (exceto ME2)
+    // 8️⃣ VERIFICAR ANOMALIA: FATURADO_APOS_ENVIO (exceto ME2)
     if (event === 'INVOICED') {
       const jetEnviado = await pool.query(
         `SELECT id FROM tracking_events 
@@ -223,11 +261,11 @@ async function processWebhook(payload) {
       }
     }
 
-    // 8️⃣ VERIFICAR PIPELINE (anomalias de SLA, prazo, etc)
+    // 9️⃣ VERIFICAR PIPELINE (anomalias de SLA, prazo, etc)
     console.log(`📊 Verificando pipeline do pedido ${numeroMarketplace}...`);
     await anomalyDetector.checkPipelineStatus(numeroMarketplace);
 
-    // 9️⃣ REGISTRAR LOG DO WEBHOOK (COM 1 em vez de true)
+    // 🔟 REGISTRAR LOG DO WEBHOOK
     await pool.query(
       `INSERT INTO webhook_log (source, event_type, payload, received_at, processed)
        VALUES ($1, $2, $3, $4, $5)`,
@@ -241,13 +279,15 @@ async function processWebhook(payload) {
       orderId: idAnyMarket, 
       numero_marketplace: numeroMarketplace,
       status: normalizedStatus,
-      marketplace: infoEssencial.marketplace
+      marketplace: infoEssencial.marketplace,
+      sla: slaStatus,
+      horas_decorridas: horasDecorridas.toFixed(1)
     };
 
   } catch (error) {
     console.error('❌ Erro ao processar AnyMarket:', error.message);
     
-    // Registrar erro no log (COM 0 em vez de false)
+    // Registrar erro no log
     try {
       await pool.query(
         `INSERT INTO webhook_log (source, event_type, payload, received_at, processed, error)
@@ -263,7 +303,7 @@ async function processWebhook(payload) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 6. FUNÇÃO PARA BUSCAR PEDIDOS (polling/backfill)
+// 7. FUNÇÃO PARA BUSCAR PEDIDOS (polling/backfill)
 // ──────────────────────────────────────────────────────────────────────────────
 async function fetchOrders(params) {
   if (params.limit && params.limit < 5) {
@@ -292,7 +332,7 @@ async function fetchOrders(params) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 7. SINCRONIZAR PEDIDOS (buscar da API e salvar)
+// 8. SINCRONIZAR PEDIDOS (buscar da API e salvar)
 // ──────────────────────────────────────────────────────────────────────────────
 async function syncOrders(since) {
   const sinceDate = since || new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
@@ -304,6 +344,8 @@ async function syncOrders(since) {
     if (jsonCompleto) {
       const infoEssencial = extrairInfoRelevante(jsonCompleto);
       if (infoEssencial?.numero_marketplace) {
+        const { sla: slaStatus, horas: horasDecorridas } = calcularSLA(infoEssencial.created_at);
+        
         await pool.query(
           `INSERT INTO pedidos_mapeamento 
            (id_anymarket, numero_marketplace, marketplace_origem, criado_em, atualizado_em)
@@ -312,6 +354,24 @@ async function syncOrders(since) {
              id_anymarket = $1,
              atualizado_em = NOW()`,
           [o.id, infoEssencial.numero_marketplace, infoEssencial.marketplace]
+        );
+        
+        await pool.query(
+          `INSERT INTO tracking_events 
+           (id, pedido_id, origem, status, timestamp, payload, dados_completos, criado_em, sla_calculado, tempo_decorrido_horas) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9)
+           ON CONFLICT (pedido_id, origem, status) DO NOTHING`,
+          [
+            uuidv4(),
+            infoEssencial.numero_marketplace,
+            'ANYMARKET',
+            'PENDENTE',
+            new Date(infoEssencial.created_at),
+            JSON.stringify({ event: 'backfill' }),
+            JSON.stringify(jsonCompleto),
+            slaStatus,
+            horasDecorridas
+          ]
         );
         upserted++;
       }
@@ -330,5 +390,6 @@ module.exports = {
   buscarDetalhesPedido,
   extrairInfoRelevante,
   fetchOrders,
-  syncOrders
+  syncOrders,
+  calcularSLA
 };

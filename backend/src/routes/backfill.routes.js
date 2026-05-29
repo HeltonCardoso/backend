@@ -71,6 +71,31 @@ router.post("/jet", async (req, res) => {
   }
 });
 
+// ─── POST /api/backfill/corrigir ─────────────────────────────────────────────
+// Corrige dados faltantes em pedidos existentes (loja, marketplace_canal, prazo)
+router.post("/corrigir", async (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+
+  send({ type: "start", message: "Iniciando correção de pedidos existentes..." });
+
+  try {
+    const result = await backfillService.corrigirPedidosExistentes({
+      onProgress: (p) => send({ type: "progress", ...p }),
+    });
+
+    send({ type: "done", result });
+    res.end();
+  } catch (err) {
+    send({ type: "error", message: err.message });
+    res.end();
+  }
+});
+
 // ─── POST /api/backfill/all ───────────────────────────────────────────────────
 // Backfill completo: Anymarket → JET → recalc SLA
 router.post("/all", async (req, res) => {

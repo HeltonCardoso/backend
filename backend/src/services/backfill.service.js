@@ -2,6 +2,7 @@
 const { v4: uuidv4 } = require('uuid');
 const db = require("../../config/database");
 const anymarketService = require("./anymarket.service");
+const jetService = require("./jet.service");
 
 let currentRun = null;
 
@@ -50,6 +51,13 @@ function getProgress() {
   return currentRun;
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ============================================================
+// BACKFILL ANYMARKET (busca pedidos históricos)
+// ============================================================
 async function backfillAnymarket({ dateFrom, dateTo, onProgress } = {}) {
   if (currentRun && currentRun.status === "running") {
     throw new Error("Já existe um backfill em andamento");
@@ -57,6 +65,7 @@ async function backfillAnymarket({ dateFrom, dateTo, onProgress } = {}) {
 
   currentRun = {
     status: "running",
+    type: "anymarket",
     inserted: 0,
     updated: 0,
     skipped: 0,
@@ -67,7 +76,7 @@ async function backfillAnymarket({ dateFrom, dateTo, onProgress } = {}) {
   const PAGE_SIZE = 50;
   const STATUS_LIST = ["INVOICED", "CANCELED", "PAID_WAITING_SHIP", "PAID_WAITING_DELIVERY", "CONCLUDED"];
 
-  console.log(`[Backfill] Iniciando com período: ${dateFrom} até ${dateTo || 'hoje'}`);
+  console.log(`[Backfill AnyMarket] Iniciando com período: ${dateFrom} até ${dateTo || 'hoje'}`);
 
   try {
     let totalStatus = STATUS_LIST.length;
@@ -77,9 +86,8 @@ async function backfillAnymarket({ dateFrom, dateTo, onProgress } = {}) {
       let offset = 0;
       let hasMore = true;
       let pageCount = 0;
-      let statusTotalFound = 0;
 
-      console.log(`[Backfill] Buscando status: ${situationCode}`);
+      console.log(`[Backfill AnyMarket] Buscando status: ${situationCode}`);
 
       while (hasMore) {
         const params = { limit: PAGE_SIZE, offset, status: situationCode };
@@ -94,7 +102,6 @@ async function backfillAnymarket({ dateFrom, dateTo, onProgress } = {}) {
             break;
           }
           
-          statusTotalFound += orders.length;
           currentRun.total_found += orders.length;
 
           for (const order of orders) {
@@ -110,17 +117,15 @@ async function backfillAnymarket({ dateFrom, dateTo, onProgress } = {}) {
             }
           }
 
-          // Calcular percentual
           const statusPercent = (statusIndex / totalStatus) * 100;
-          const pagePercent = (pageCount / 10) * (100 / totalStatus); // Estimativa de até 10 páginas por status
+          const pagePercent = (pageCount / 10) * (100 / totalStatus);
           let percent = Math.min(99, Math.floor(statusPercent + pagePercent));
           
-          // Se já processou muitos pedidos, calcular baseado no total
           if (currentRun.total_found > 1000) {
             percent = Math.min(99, Math.floor((currentRun.total_found / 10000) * 100));
           }
 
-          console.log(`[Backfill] ${situationCode} - Página ${pageCount + 1}: ${orders.length} pedidos. Inseridos: ${currentRun.inserted}, Status alterados: ${currentRun.status_changes}`);
+          console.log(`[Backfill AnyMarket] ${situationCode} - Página ${pageCount + 1}: ${orders.length} pedidos`);
 
           if (onProgress) {
             onProgress({ 
@@ -144,7 +149,7 @@ async function backfillAnymarket({ dateFrom, dateTo, onProgress } = {}) {
           }
           
         } catch (err) {
-          console.error(`[Backfill] Erro na busca para ${situationCode}:`, err.message);
+          console.error(`[Backfill AnyMarket] Erro na busca:`, err.message);
           break;
         }
       }
@@ -152,13 +157,12 @@ async function backfillAnymarket({ dateFrom, dateTo, onProgress } = {}) {
     }
 
     currentRun.status = "done";
-    console.log(`[Backfill] ===== RESUMO FINAL =====`);
-    console.log(`[Backfill] Total encontrado: ${currentRun.total_found}`);
-    console.log(`[Backfill] Inseridos: ${currentRun.inserted}`);
-    console.log(`[Backfill] Atualizados: ${currentRun.updated}`);
-    console.log(`[Backfill] Mudanças de status: ${currentRun.status_changes}`);
-    console.log(`[Backfill] Ignorados: ${currentRun.skipped}`);
-    console.log(`[Backfill] ========================`);
+    console.log(`[Backfill AnyMarket] ===== RESUMO FINAL =====`);
+    console.log(`[Backfill AnyMarket] Total encontrado: ${currentRun.total_found}`);
+    console.log(`[Backfill AnyMarket] Inseridos: ${currentRun.inserted}`);
+    console.log(`[Backfill AnyMarket] Atualizados: ${currentRun.updated}`);
+    console.log(`[Backfill AnyMarket] Mudanças de status: ${currentRun.status_changes}`);
+    console.log(`[Backfill AnyMarket] Ignorados: ${currentRun.skipped}`);
     
     if (onProgress) {
       onProgress({ 
@@ -177,17 +181,17 @@ async function backfillAnymarket({ dateFrom, dateTo, onProgress } = {}) {
   } catch (err) {
     currentRun.status = "error";
     currentRun.error = err.message;
-    console.error(`[Backfill] ERRO FATAL:`, err);
+    console.error(`[Backfill AnyMarket] ERRO FATAL:`, err);
     if (onProgress) {
-      onProgress({ 
-        type: 'error', 
-        message: err.message 
-      });
+      onProgress({ type: 'error', message: err.message });
     }
     throw err;
   }
 }
 
+// ============================================================
+// UPSERT ORDER (com campos completos)
+// ============================================================
 async function upsertOrder(o) {
   const anymarketId = String(o.id);
   const numeroMarketplace = String(o.marketPlaceId || o.marketplaceOrderId || "");
@@ -199,6 +203,8 @@ async function upsertOrder(o) {
   const marketplaceOrigem = o.marketPlace || o.marketplaceName || null;
   const loja = o.accountName || null;
   const marketplaceCanal = o.marketPlace || o.marketplaceName || null;
+  const promisedShippingTime = o.shipping?.promisedShippingTime;
+  const prazoDespacho = promisedShippingTime ? new Date(promisedShippingTime) : null;
 
   // Verificar se o pedido já existe
   const existing = await db.query(
@@ -209,64 +215,19 @@ async function upsertOrder(o) {
   );
 
   if (existing.rows.length > 0) {
-    // Buscar último status registrado
-    const lastEvent = await db.query(
-      `SELECT status, timestamp 
-       FROM tracking_events 
-       WHERE pedido_id = $1 
-       ORDER BY timestamp DESC 
-       LIMIT 1`,
-      [numeroMarketplace]
-    );
-    
-    const lastStatus = lastEvent.rows[0]?.status;
-    const statusChanged = lastStatus !== currentStatus;
-    
-    // Atualiza dados do pedido
+    // ATUALIZAR pedido existente com campos que podem estar faltando
     await db.query(`
       UPDATE pedidos_mapeamento 
       SET id_anymarket = $1, 
-          marketplace_origem = $2,
-          loja = $3,
-          marketplace_canal = $4,
+          marketplace_origem = COALESCE(pedidos_mapeamento.marketplace_origem, $2),
+          loja = COALESCE(pedidos_mapeamento.loja, $3),
+          marketplace_canal = COALESCE(pedidos_mapeamento.marketplace_canal, $4),
+          prazo_despacho = COALESCE(pedidos_mapeamento.prazo_despacho, $5),
           atualizado_em = NOW()
-      WHERE numero_marketplace = $5
-    `, [anymarketId, marketplaceOrigem, loja, marketplaceCanal, numeroMarketplace]);
+      WHERE numero_marketplace = $6
+    `, [anymarketId, marketplaceOrigem, loja, marketplaceCanal, prazoDespacho, numeroMarketplace]);
     
-    if (!statusChanged) {
-      return "updated";
-    }
-    
-    // Registrar mudança de status
-    await db.query(`
-      INSERT INTO tracking_events (
-        id, pedido_id, origem, status, timestamp, payload, criado_em, dados_completos, sla_calculado, tempo_decorrido_horas
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9)
-      ON CONFLICT (pedido_id, origem, status) 
-      DO UPDATE SET 
-        timestamp = EXCLUDED.timestamp,
-        payload = EXCLUDED.payload,
-        dados_completos = EXCLUDED.dados_completos,
-        criado_em = NOW()
-    `, [
-      uuidv4(), 
-      numeroMarketplace, 
-      'ANYMARKET', 
-      currentStatus, 
-      createdAt, 
-      JSON.stringify({ 
-        event: 'status_changed',
-        old_status: lastStatus, 
-        new_status: currentStatus,
-        order_id: anymarketId
-      }),
-      JSON.stringify(o),
-      null,
-      null
-    ]);
-    
-    return "status_changed";
+    return "updated";
     
   } else {
     // INSERT - Novo pedido
@@ -277,17 +238,19 @@ async function upsertOrder(o) {
         marketplace_origem, 
         loja, 
         marketplace_canal,
+        prazo_despacho,
         criado_em, 
         atualizado_em
       )
-      VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-    `, [anymarketId, numeroMarketplace, marketplaceOrigem, loja, marketplaceCanal]);
+      VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+    `, [anymarketId, numeroMarketplace, marketplaceOrigem, loja, marketplaceCanal, prazoDespacho]);
     
+    // Criar tracking event básico
     await db.query(`
       INSERT INTO tracking_events (
-        id, pedido_id, origem, status, timestamp, payload, criado_em, dados_completos, sla_calculado, tempo_decorrido_horas
+        id, pedido_id, origem, status, timestamp, payload, criado_em, dados_completos
       )
-      VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9)
+      VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
       ON CONFLICT (pedido_id, origem, status) 
       DO NOTHING
     `, [
@@ -296,24 +259,307 @@ async function upsertOrder(o) {
       'ANYMARKET', 
       currentStatus, 
       createdAt, 
-      JSON.stringify({ 
-        event: 'pedido_criado',
-        order_id: anymarketId
-      }),
-      JSON.stringify(o),
-      null,
-      null
+      JSON.stringify({ event: 'backfill', order_id: anymarketId }),
+      JSON.stringify(o)
     ]);
     
     return "inserted";
   }
 }
 
-async function backfillJet({ dateFrom, dateTo, onProgress } = {}) {
-  console.log(`[Backfill Jet] Iniciando`);
-  return { updated: 0, message: "JET enrichment completed" };
+// ============================================================
+// BACKFILL JET - Buscar dados faltantes da JET e CRIAR EVENTOS
+// ============================================================
+async function backfillJet({ onProgress } = {}) {
+  if (currentRun && currentRun.status === "running") {
+    throw new Error("Já existe um backfill em andamento");
+  }
+
+  currentRun = {
+    status: "running",
+    type: "jet",
+    total: 0,
+    updated: 0,
+    events_created: 0,
+    errors: 0,
+    skipped: 0
+  };
+
+  console.log(`[Backfill JET] Iniciando busca de pedidos sem id_jet...`);
+
+  try {
+    const { rows: pedidos } = await db.query(`
+      SELECT 
+        numero_marketplace, 
+        id_anymarket,
+        marketplace_origem
+      FROM pedidos_mapeamento 
+      WHERE (id_jet IS NULL OR id_jet = '')
+        AND id_anymarket IS NOT NULL
+      ORDER BY criado_em DESC
+      LIMIT 500
+    `);
+
+    currentRun.total = pedidos.length;
+    console.log(`[Backfill JET] Encontrados ${pedidos.length} pedidos para processar`);
+
+    if (onProgress) {
+      onProgress({ type: 'start', total: pedidos.length });
+    }
+
+    for (let i = 0; i < pedidos.length; i++) {
+      const pedido = pedidos[i];
+      
+      try {
+        console.log(`[Backfill JET] Processando ${i+1}/${pedidos.length}: ${pedido.numero_marketplace}`);
+        
+        const anymarketData = await anymarketService.buscarDetalhesPedido(pedido.id_anymarket);
+        
+        if (anymarketData) {
+          const marketPlaceNumber = anymarketData.marketPlaceNumber || anymarketData.marketPlaceId;
+          
+          if (marketPlaceNumber) {
+            const jetData = await jetService.buscarDetalhesPedido(marketPlaceNumber);
+            
+            if (jetData) {
+              const infoJet = jetService.extrairInfoRelevante(jetData);
+              
+              if (infoJet && infoJet.id) {
+                const deliveryTime = jetData.deliveryTime || 0;
+                const prazoPreparacaoHoras = deliveryTime === 0 ? 24 : deliveryTime * 24;
+                
+                // Atualizar pedido_mapeamento
+                await db.query(`
+                  UPDATE pedidos_mapeamento 
+                  SET id_jet = $1,
+                      delivery_time_jet = $2,
+                      prazo_preparacao_horas = $3,
+                      atualizado_em = NOW()
+                  WHERE numero_marketplace = $4
+                `, [infoJet.id, deliveryTime, prazoPreparacaoHoras, pedido.numero_marketplace]);
+                
+                currentRun.updated++;
+                
+                // Criar evento JET
+                const history = jetData.historyListOrderStatus || [];
+                let eventosCriados = 0;
+                
+                for (const statusHistory of history) {
+                  const statusCode = statusHistory.statusCode;
+                  const dateRegister = statusHistory.dateRegisterStatus;
+                  
+                  let statusName = 'DESCONHECIDO';
+                  if (statusCode === '01') statusName = 'INTEGRADO';
+                  if (statusCode === '04') statusName = 'PROCESSANDO';
+                  if (statusCode === '07') statusName = 'EM_PRODUCAO';
+                  if (statusCode === '05') statusName = 'PRONTO';
+                  
+                  if (statusName !== 'DESCONHECIDO') {
+                    const result = await db.query(`
+                      INSERT INTO tracking_events 
+                      (id, pedido_id, origem, status, timestamp, dados_completos, criado_em)
+                      VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                      ON CONFLICT (pedido_id, origem, status) DO NOTHING
+                    `, [
+                      uuidv4(),
+                      pedido.numero_marketplace,
+                      'JET',
+                      statusName,
+                      new Date(dateRegister),
+                      JSON.stringify(jetData)
+                    ]);
+                    if (result.rowCount > 0) eventosCriados++;
+                  }
+                }
+                
+                // Se não criou nenhum evento, cria pelo menos um básico
+                if (eventosCriados === 0) {
+                  await db.query(`
+                    INSERT INTO tracking_events 
+                    (id, pedido_id, origem, status, timestamp, dados_completos, criado_em)
+                    VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                    ON CONFLICT (pedido_id, origem, status) DO NOTHING
+                  `, [
+                    uuidv4(),
+                    pedido.numero_marketplace,
+                    'JET',
+                    'INTEGRADO',
+                    new Date(jetData.dateOrder || jetData.marketPlaceDateCreated),
+                    JSON.stringify(jetData)
+                  ]);
+                  eventosCriados = 1;
+                }
+                
+                currentRun.events_created += eventosCriados;
+                console.log(`[Backfill JET] ✅ Atualizado: ${pedido.numero_marketplace} -> id_jet: ${infoJet.id} (${eventosCriados} eventos)`);
+              } else {
+                currentRun.skipped++;
+              }
+            } else {
+              currentRun.errors++;
+            }
+          } else {
+            currentRun.skipped++;
+          }
+        } else {
+          currentRun.errors++;
+        }
+        
+        if ((i + 1) % 10 === 0 && onProgress) {
+          onProgress({
+            type: 'progress',
+            processed: i + 1,
+            total: pedidos.length,
+            updated: currentRun.updated,
+            events_created: currentRun.events_created,
+            errors: currentRun.errors,
+            percent: Math.round(((i + 1) / pedidos.length) * 100)
+          });
+        }
+        
+        await sleep(500);
+        
+      } catch (error) {
+        currentRun.errors++;
+        console.error(`[Backfill JET] Erro:`, error.message);
+      }
+    }
+
+    currentRun.status = "done";
+    console.log(`[Backfill JET] ===== RESUMO FINAL =====`);
+    console.log(`[Backfill JET] Total: ${currentRun.total}`);
+    console.log(`[Backfill JET] Mapeamentos: ${currentRun.updated}`);
+    console.log(`[Backfill JET] Eventos criados: ${currentRun.events_created}`);
+    console.log(`[Backfill JET] Erros: ${currentRun.errors}`);
+    console.log(`[Backfill JET] Ignorados: ${currentRun.skipped}`);
+
+    if (onProgress) {
+      onProgress({ type: 'done', ...currentRun });
+    }
+
+    return currentRun;
+
+  } catch (err) {
+    currentRun.status = "error";
+    currentRun.error = err.message;
+    console.error(`[Backfill JET] ERRO FATAL:`, err);
+    if (onProgress) {
+      onProgress({ type: 'error', message: err.message });
+    }
+    throw err;
+  }
 }
 
+// ============================================================
+// CORRIGIR PEDIDOS EXISTENTES (NÃO CRIA EVENTOS)
+// ============================================================
+async function corrigirPedidosExistentes({ onProgress } = {}) {
+  if (currentRun && currentRun.status === "running") {
+    throw new Error("Já existe um backfill em andamento");
+  }
+
+  currentRun = {
+    status: "running",
+    type: "correcao",
+    total: 0,
+    atualizados: 0,
+    erros: 0
+  };
+
+  console.log(`[Correção] Buscando pedidos com dados faltantes...`);
+
+  try {
+    const { rows: pedidos } = await db.query(`
+      SELECT 
+        numero_marketplace,
+        id_anymarket
+      FROM pedidos_mapeamento 
+      WHERE (loja IS NULL OR loja = '')
+         OR (marketplace_canal IS NULL OR marketplace_canal = '')
+         OR (prazo_despacho IS NULL)
+        AND id_anymarket IS NOT NULL
+      ORDER BY criado_em DESC
+      LIMIT 500
+    `);
+
+    currentRun.total = pedidos.length;
+    console.log(`[Correção] Encontrados ${pedidos.length} pedidos para corrigir`);
+
+    if (onProgress) {
+      onProgress({ type: 'start', total: pedidos.length });
+    }
+
+    for (let i = 0; i < pedidos.length; i++) {
+      const pedido = pedidos[i];
+      
+      try {
+        const anymarketData = await anymarketService.buscarDetalhesPedido(pedido.id_anymarket);
+        
+        if (anymarketData) {
+          const loja = anymarketData.accountName || null;
+          const marketplaceCanal = anymarketData.marketPlace || null;
+          const promisedShippingTime = anymarketData.shipping?.promisedShippingTime;
+          const prazoDespacho = promisedShippingTime ? new Date(promisedShippingTime) : null;
+          
+          await db.query(`
+            UPDATE pedidos_mapeamento 
+            SET loja = COALESCE(pedidos_mapeamento.loja, $1),
+                marketplace_canal = COALESCE(pedidos_mapeamento.marketplace_canal, $2),
+                prazo_despacho = COALESCE(pedidos_mapeamento.prazo_despacho, $3),
+                atualizado_em = NOW()
+            WHERE numero_marketplace = $4
+          `, [loja, marketplaceCanal, prazoDespacho, pedido.numero_marketplace]);
+          
+          currentRun.atualizados++;
+          console.log(`[Correção] ✅ Atualizado: ${pedido.numero_marketplace}`);
+        } else {
+          currentRun.erros++;
+        }
+        
+        if ((i + 1) % 10 === 0 && onProgress) {
+          onProgress({
+            type: 'progress',
+            processed: i + 1,
+            total: pedidos.length,
+            atualizados: currentRun.atualizados,
+            percent: Math.round(((i + 1) / pedidos.length) * 100)
+          });
+        }
+        
+        await sleep(200);
+        
+      } catch (error) {
+        currentRun.erros++;
+        console.error(`[Correção] Erro:`, error.message);
+      }
+    }
+
+    currentRun.status = "done";
+    console.log(`[Correção] ===== RESUMO FINAL =====`);
+    console.log(`[Correção] Total: ${currentRun.total}`);
+    console.log(`[Correção] Atualizados: ${currentRun.atualizados}`);
+    console.log(`[Correção] Erros: ${currentRun.erros}`);
+
+    if (onProgress) {
+      onProgress({ type: 'done', ...currentRun });
+    }
+
+    return currentRun;
+
+  } catch (err) {
+    currentRun.status = "error";
+    currentRun.error = err.message;
+    console.error(`[Correção] ERRO FATAL:`, err);
+    if (onProgress) {
+      onProgress({ type: 'error', message: err.message });
+    }
+    throw err;
+  }
+}
+
+// ============================================================
+// BACKFILL COMPLETO
+// ============================================================
 async function backfillAll({ dateFrom, dateTo, onProgress } = {}) {
   const results = {};
   
@@ -321,7 +567,7 @@ async function backfillAll({ dateFrom, dateTo, onProgress } = {}) {
   results.anymarket = await backfillAnymarket({ dateFrom, dateTo, onProgress });
   
   if (onProgress) onProgress({ phase: "jet", status: "starting" });
-  results.jet = await backfillJet({ dateFrom, dateTo, onProgress });
+  results.jet = await backfillJet({ onProgress });
   
   return results;
 }
@@ -334,14 +580,11 @@ async function getRunHistory(limit = 20) {
   return [];
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 module.exports = {
   backfillAnymarket,
   backfillJet,
   backfillAll,
+  corrigirPedidosExistentes,
   recalcAllSla,
   getRunHistory,
   getProgress,

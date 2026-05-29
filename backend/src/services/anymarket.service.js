@@ -1,7 +1,7 @@
 // backend/src/services/anymarket.service.js
 const axios = require("axios");
 const { v4: uuidv4 } = require('uuid');
-const pool = require("../../config/database");  // ← PostgreSQL pool
+const pool = require("../../config/database");
 
 const BASE_URL = process.env.ANYMARKET_BASE_URL || "https://api.anymarket.com.br/v2";
 const TOKEN = process.env.ANYMARKET_TOKEN;
@@ -15,7 +15,7 @@ const api = axios.create({
   timeout: 15000,
 });
 
-// Mapeamento de status
+// Mapeamento de status ANYMARKET → status interno
 function mapStatus(anymarketStatus) {
   const map = {
     "APPROVED": "APROVADO",
@@ -57,7 +57,11 @@ async function fetchOrders(params) {
 // CORRIGIDO: Salvar/atualizar pedido usando PostgreSQL
 async function upsertOrder(o) {
   const anymarketId = String(o.id);
-  const numeroMarketplace = String(o.marketPlaceId || o.marketplaceOrderId || o.oi || "");
+  
+  // 🔥 CORREÇÃO CRUCIAL: NÃO usar o.oi como fallback!
+  // O .oi é código interno da AnyMarket, não é o número do pedido no marketplace
+  const numeroMarketplace = String(o.marketPlaceId || o.marketplaceOrderId || "");
+  
   const createdAt = o.createdAt || o.created_at || new Date().toISOString();
   const currentStatus = mapStatus(o.status || o.situationCode);
   
@@ -65,10 +69,18 @@ async function upsertOrder(o) {
   const loja = o.accountName || null;
   const marketplaceCanal = o.marketPlace || o.marketplaceName || null;
 
-  if (!numeroMarketplace) {
-    console.error(`[Upsert] Pedido ${anymarketId} sem numero_marketplace`);
-    return { action: 'ignored', error: 'sem_numero_marketplace' };
+  // Validação: se não tem numero_marketplace, NÃO SALVAR
+  if (!numeroMarketplace || numeroMarketplace === "undefined" || numeroMarketplace === "") {
+    console.error(`[Upsert] ⚠️ Pedido ${anymarketId} ignorado - sem marketPlaceId! Oi recebido: ${o.oi}`);
+    return { 
+      action: 'ignored', 
+      error: 'sem_marketplace_id',
+      anymarketId,
+      oi_recebido: o.oi 
+    };
   }
+
+  console.log(`[Upsert] Processando: AnyMarket=${anymarketId} | Marketplace=${numeroMarketplace} | Status=${currentStatus}`);
 
   try {
     // Verificar se o pedido já existe
@@ -101,7 +113,6 @@ async function upsertOrder(o) {
         WHERE numero_marketplace = $5
       `, [anymarketId, marketplaceOrigem, loja, marketplaceCanal, numeroMarketplace]);
       
-      // CORRIGIDO: com ON CONFLICT
       if (statusChanged) {
         await pool.query(`
           INSERT INTO tracking_events (
@@ -114,28 +125,41 @@ async function upsertOrder(o) {
             payload = EXCLUDED.payload,
             criado_em = NOW()
         `, [
-          uuidv4(), numeroMarketplace, 'ANYMARKET', currentStatus, createdAt,
-          JSON.stringify({ event: 'status_changed', old_status: lastStatus, new_status: currentStatus }),
+          uuidv4(), 
+          numeroMarketplace, 
+          'ANYMARKET', 
+          currentStatus, 
+          createdAt, 
+          JSON.stringify({ 
+            event: 'status_changed', 
+            old_status: lastStatus, 
+            new_status: currentStatus 
+          }),
           JSON.stringify(o)
         ]);
         
-        console.log(`[Upsert] Pedido ${anymarketId}: ${lastStatus} → ${currentStatus}`);
+        console.log(`[Upsert] ✅ Pedido ${anymarketId}: ${lastStatus} → ${currentStatus}`);
       } else {
-        console.log(`[Upsert] Pedido ${anymarketId} atualizado (mesmo status)`);
+        console.log(`[Upsert] 📝 Pedido ${anymarketId} atualizado (mesmo status)`);
       }
       
-      return { action: 'updated' };
+      return { action: 'updated', numero_marketplace: numeroMarketplace };
       
     } else {
       // NOVO PEDIDO
       await pool.query(`
         INSERT INTO pedidos_mapeamento (
-          id_anymarket, numero_marketplace, marketplace_origem, loja, marketplace_canal, criado_em, atualizado_em
+          id_anymarket, 
+          numero_marketplace, 
+          marketplace_origem, 
+          loja, 
+          marketplace_canal, 
+          criado_em, 
+          atualizado_em
         )
         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
       `, [anymarketId, numeroMarketplace, marketplaceOrigem, loja, marketplaceCanal]);
       
-      // CORRIGIDO: com ON CONFLICT
       await pool.query(`
         INSERT INTO tracking_events (
           id, pedido_id, origem, status, timestamp, payload, criado_em, dados_completos
@@ -143,80 +167,95 @@ async function upsertOrder(o) {
         VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
         ON CONFLICT (pedido_id, origem, status) DO NOTHING
       `, [
-        uuidv4(), numeroMarketplace, 'ANYMARKET', currentStatus, createdAt,
-        JSON.stringify({ event: 'pedido_criado' }),
+        uuidv4(), 
+        numeroMarketplace, 
+        'ANYMARKET', 
+        currentStatus, 
+        createdAt, 
+        JSON.stringify({ 
+          event: 'pedido_criado' 
+        }),
         JSON.stringify(o)
       ]);
       
-      console.log(`[Upsert] Pedido ${anymarketId} inserido`);
-      return { action: 'inserted' };
+      console.log(`[Upsert] 🆕 Pedido ${anymarketId} INSERIDO | Marketplace: ${numeroMarketplace}`);
+      return { action: 'inserted', numero_marketplace: numeroMarketplace };
     }
   } catch (err) {
-    console.error(`[Upsert] Erro:`, err.message);
+    console.error(`[Upsert] ❌ Erro no pedido ${anymarketId}:`, err.message);
     throw err;
   }
 }
 
-// CORRIGIDO: Processar webhook usando PostgreSQL
+// CORRIGIDO: Processar webhook
 async function processWebhook(payload) {
   const now = new Date().toISOString();
 
   try {
-    // 🔥 CORREÇÃO: Extrair o pedido do content
-    let orderData = payload;
-    
-    // Se tiver a estrutura { type, event, content }, usa o content
-    if (payload.content && payload.content.id) {
-      orderData = payload.content;
-      console.log(`[Webhook] Extraindo order do content: ${orderData.id}`);
+    // Função para extrair o pedido de qualquer formato
+    function extractOrder(data) {
+      // Caso 1: { content: { id, ... } }
+      if (data.content?.id) return data.content;
+      
+      // Caso 2: { data: { id, ... } }
+      if (data.data?.id) return data.data;
+      
+      // Caso 3: { id, ... } direto
+      if (data.id) return data;
+      
+      // Caso 4: array com um pedido
+      if (Array.isArray(data) && data[0]?.id) return data[0];
+      
+      return data;
     }
     
-    // Se tiver a estrutura { data: { ... } }
-    if (payload.data && payload.data.id) {
-      orderData = payload.data;
-    }
+    const rawOrder = extractOrder(payload);
+    const orderId = rawOrder.id;
     
-    const orderId = orderData.id || payload.id;
     if (!orderId) {
-      console.error('[Webhook] Payload sem orderId:', JSON.stringify(payload).substring(0, 500));
+      console.error('[Webhook] Não foi possível extrair orderId do payload:', 
+        JSON.stringify(payload).substring(0, 300));
       return { ok: false, error: 'Webhook sem orderId' };
     }
 
-    // Mapear o evento para status
-    const eventToStatus = {
+    // Mapeamento de eventos para status
+    const statusMap = {
+      'ORDER': 'PENDENTE',
       'PAID_WAITING_SHIP': 'PAGO_AGUARDANDO_ENVIO',
       'PAID_WAITING_DELIVERY': 'PAGO_AGUARDANDO_ENTREGA',
       'INVOICED': 'FATURADO',
       'SHIPPED': 'ENVIADO',
       'DELIVERED': 'ENTREGUE',
       'CANCELED': 'CANCELADO',
-      'APPROVED': 'APROVADO'
+      'APPROVED': 'APROVADO',
+      'WAITING_PAYMENT': 'AGUARDANDO_PAGAMENTO'
     };
     
-    // Pega o status do event ou do orderData.status
-    const statusRaw = orderData.status || payload.event || payload.type;
-    const currentStatus = eventToStatus[statusRaw] || mapStatus(statusRaw);
+    // Determinar o status
+    const eventType = payload.event || payload.type;
+    const orderStatus = rawOrder.status || rawOrder.situationCode;
+    const currentStatus = statusMap[eventType] || statusMap[orderStatus] || mapStatus(orderStatus) || 'DESCONHECIDO';
     
-    // Prepara os dados do pedido no formato que o upsertOrder espera
+    // Montar objeto padronizado para o upsertOrder
     const orderForUpsert = {
       id: orderId,
-      marketPlaceId: orderData.marketPlaceId || orderData.marketplaceOrderId || orderData.oi || orderId,
-      marketPlace: orderData.marketPlace || orderData.marketplaceName,
+      marketPlaceId: rawOrder.marketPlaceId || rawOrder.marketplaceOrderId || rawOrder.marketPlaceNumber,
+      marketPlace: rawOrder.marketPlace || rawOrder.marketplaceName || payload.marketplaceName,
       status: currentStatus,
-      situationCode: payload.event,
-      createdAt: orderData.createdAt || orderData.created_at || now,
-      accountName: orderData.accountName,
-      total: orderData.total || orderData.totalAmount
+      situationCode: payload.event || orderStatus,
+      createdAt: rawOrder.createdAt || rawOrder.created_at || rawOrder.orderDate || now,
+      accountName: rawOrder.accountName,
+      total: rawOrder.total || rawOrder.totalAmount
     };
     
-    console.log(`[Webhook] Processando pedido: ${orderId}, status: ${currentStatus}`);
+    console.log(`[Webhook] 🚚 Pedido ${orderId} | Status: ${currentStatus} | Evento: ${payload.event || payload.type}`);
 
     // Registrar log do webhook
     const logResult = await pool.query(`
       INSERT INTO webhook_log (source, event_type, payload, received_at)
       VALUES ($1, $2, $3, $4)
       RETURNING id
-    `, ['anymarket', payload.type || payload.event || "unknown", JSON.stringify(payload), now]);
+    `, ['anymarket', payload.event || payload.type || "unknown", JSON.stringify(payload), now]);
 
     const logId = logResult.rows[0].id;
 
@@ -226,11 +265,11 @@ async function processWebhook(payload) {
     // Marcar como processado
     await pool.query(`UPDATE webhook_log SET processed = 1 WHERE id = $1`, [logId]);
     
-    console.log(`[Webhook Anymarket] Processado com sucesso: ${orderId}`);
+    console.log(`[Webhook] ✅ Pedido ${orderId} processado com sucesso`);
     return { ok: true, orderId, result };
     
   } catch (err) {
-    console.error(`[Webhook Anymarket] Erro:`, err.message);
+    console.error(`[Webhook] ❌ Erro:`, err.message);
     return { ok: false, error: err.message };
   }
 }

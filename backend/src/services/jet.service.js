@@ -70,7 +70,7 @@ async function buscarDetalhesPedido(idOrder, tentativa = 1) {
           'apiKey': API_KEY,
           'Content-Type': 'application/json'
         },
-        timeout: 60000  // ⭐ AUMENTADO PARA 60 SEGUNDOS
+        timeout: 60000
       });
 
       if (response.data) {
@@ -86,7 +86,7 @@ async function buscarDetalhesPedido(idOrder, tentativa = 1) {
       
       if (isTimeout) {
         console.log(`⏳ Timeout na tentativa ${tentativaAtual}, aguardando ${tentativaAtual * 3}s...`);
-        await delay(tentativaAtual * 3000);  // Espera progressiva: 3s, 6s, 9s
+        await delay(tentativaAtual * 3000);
         continue;
       }
       
@@ -114,14 +114,23 @@ async function buscarDetalhesPedido(idOrder, tentativa = 1) {
   return null;
 }
 
-// Extrair informações relevantes
+// Extrair informações relevantes (incluindo deliveryTime)
 function extrairInfoRelevante(detalhes) {
   if (!detalhes) return null;
+  
+  const history = detalhes.historyListOrderStatus || [];
+  
   return {
     id: detalhes.idOrder,
     numero_marketplace: detalhes.marketPlaceNumberOrder,
     marketplace: detalhes.marketPlaceName,
-    status: detalhes.historyListOrderStatus?.[0]?.statusCode || 'DESCONHECIDO'
+    status: detalhes.nameStatus || 'DESCONHECIDO',
+    // ⭐ NOVO CAMPO - TEMPO DE PREPARAÇÃO (dias)
+    deliveryTime: detalhes.deliveryTime || 0,  // 0 = pronta entrega
+    // Datas importantes do histórico
+    data_integracao: history.find(h => h.statusCode === '01')?.dateRegisterStatus,
+    data_producao: history.find(h => h.statusCode === '07')?.dateRegisterStatus,
+    data_pronto: history.find(h => h.statusCode === '05')?.dateRegisterStatus
   };
 }
 
@@ -170,17 +179,24 @@ async function processWebhook(payload) {
 
     const numeroMarketplace = String(infoEssencial.numero_marketplace);
     const normalizedStatus = STATUS_MAP[event] || event;
+    const deliveryTimeDias = infoEssencial.deliveryTime || 0;
+    const prazoPreparacaoHoras = deliveryTimeDias === 0 ? 24 : deliveryTimeDias * 24; // Pronta entrega = 24h
 
     console.log(`✅ Marketplace ID: ${numeroMarketplace}`);
     console.log(`🏪 Marketplace: ${infoEssencial.marketplace}`);
     console.log(`📊 Status: ${event} → ${normalizedStatus}`);
+    console.log(`📦 DeliveryTime JET: ${deliveryTimeDias} dias ${deliveryTimeDias === 0 ? '(pronta entrega)' : ''}`);
+    console.log(`⏰ Prazo preparação: ${prazoPreparacaoHoras} horas`);
 
     // Salvar tracking event
     await pool.query(
       `INSERT INTO tracking_events 
        (id, pedido_id, origem, status, timestamp, payload, dados_completos, criado_em) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-       ON CONFLICT (pedido_id, origem, status) DO NOTHING`,
+       ON CONFLICT (pedido_id, origem, status) DO UPDATE SET
+         timestamp = EXCLUDED.timestamp,
+         payload = EXCLUDED.payload,
+         dados_completos = EXCLUDED.dados_completos`,
       [
         uuidv4(),
         numeroMarketplace,
@@ -194,15 +210,18 @@ async function processWebhook(payload) {
 
     console.log(`✅ JET ${numeroMarketplace} - Evento ${event} salvo`);
 
-    // Salvar mapeamento
+    // Salvar/atualizar mapeamento (COM deliveryTime)
     await pool.query(
       `INSERT INTO pedidos_mapeamento 
-       (id_jet, numero_marketplace, atualizado_em)
-       VALUES ($1, $2, NOW())
+       (id_jet, numero_marketplace, marketplace_origem, delivery_time_jet, prazo_preparacao_horas, atualizado_em)
+       VALUES ($1, $2, $3, $4, $5, NOW())
        ON CONFLICT (numero_marketplace) DO UPDATE SET
          id_jet = EXCLUDED.id_jet,
+         marketplace_origem = COALESCE(pedidos_mapeamento.marketplace_origem, EXCLUDED.marketplace_origem),
+         delivery_time_jet = EXCLUDED.delivery_time_jet,
+         prazo_preparacao_horas = EXCLUDED.prazo_preparacao_horas,
          atualizado_em = NOW()`,
-      [searchId, numeroMarketplace]
+      [searchId, numeroMarketplace, infoEssencial.marketplace, deliveryTimeDias, prazoPreparacaoHoras]
     );
 
     // Evento especial: Em produção
@@ -285,7 +304,6 @@ async function salvarWebhookSemAPI(idInterno, numeroPedido, event, eventOccurred
 
     console.log(`✅ JET ${pedidoId} salvo em fallback`);
 
-    // Log do webhook - MESMO PADRÃO DO ANYMARKET (usa 1 inteiro)
     await pool.query(
       `INSERT INTO webhook_log (source, event_type, payload, received_at, processed)
        VALUES ($1, $2, $3, $4, $5)`,

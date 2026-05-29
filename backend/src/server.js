@@ -28,7 +28,7 @@ if (process.env.NODE_ENV !== "production") {
 // ─── ROTAS ────────────────────────────────────────────────────────────────────
 app.use("/api/orders",   require("./routes/orders.routes"));
 app.use("/api/backfill", require("./routes/backfill.routes"));
-app.use("/api/webhooks", require("./routes/webhook.routes"));
+app.use("/api/webhooks", require("./routes/webhook.routes"));  // ← Webhooks aqui!
 app.use("/api/dashboard", require("./routes/dashboard.routes"));
 app.use("/api/auth", require("./routes/auth.routes"));
 app.use("/api/upload", require("./routes/upload.routes"));
@@ -56,7 +56,7 @@ app.get('/api/test-db', async (req, res) => {
   }
 });
 
-// Rota para sincronizar pedidos
+// Rota para sincronizar pedidos do Mercado Livre
 app.post('/api/meli/sync-orders', async (req, res) => {
     try {
         const result = await meliOrdersService.syncOrders();
@@ -77,11 +77,8 @@ cron.schedule("0 * * * *", () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// 🚨 PARTE CRUCIAL PARA O REACT - ADICIONE ISSO!
-// ════════════════════════════════════════════════════════════════════════════
-
 // Servir os arquivos estáticos do React (build do Vite)
-// O caminho './dist' é onde o Vite gera os arquivos
+// ════════════════════════════════════════════════════════════════════════════
 app.use(express.static(path.join(process.cwd(), 'frontend/dist')));
 
 app.get('*', (req, res) => {

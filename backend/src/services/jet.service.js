@@ -1,19 +1,15 @@
+// backend/src/services/jet.service.js
 /**
- * jet.service.js
- * 
- * Integração com a API da JET e-Commerce.
- * Suporta:
- *  - Busca de pedidos com paginação
- *  - Enriquecimento de pedidos existentes no banco
- *  - Processamento de webhooks da JET
+ * jet.service.js - CORRIGIDO para usar pedidos_mapeamento + tracking_events
  */
 
 const axios = require("axios");
-const db = require("../models/db");
+const { v4: uuidv4 } = require('uuid');
+const db = require("../../config/database");
 
 const BASE_URL = process.env.JET_BASE_URL || "https://api.jet.com.br/api";
 
-// ─── AUTH — JET usa OAuth2 client_credentials ─────────────────────────────────
+// ─── AUTH - JET OAuth2 ─────────────────────────────────────────────────────
 let _token = null;
 let _tokenExpiry = 0;
 
@@ -30,7 +26,6 @@ async function getToken() {
   });
 
   _token = data.access_token;
-  // Expira 5min antes para segurança
   _tokenExpiry = Date.now() + (data.expires_in - 300) * 1000;
   return _token;
 }
@@ -45,162 +40,248 @@ async function apiGet(path, params = {}) {
   return data;
 }
 
-// ─── BUSCAR PEDIDOS ───────────────────────────────────────────────────────────
+// ─── MAPEAMENTO DE STATUS JET → STATUS INTERNO ─────────────────────────────
+function mapStatus(jetStatus) {
+  const map = {
+    'Pedido.Pago': 'PAGO',
+    'Pedido.Aprovado': 'APROVADO',
+    'Pedido.EmProducao': 'EM_PRODUCAO',
+    'Pedido.Enviado': 'ENVIADO',
+    'Pedido.Entregue': 'ENTREGUE',
+    'Pedido.Cancelado': 'CANCELADO',
+    'new': 'NOVO',
+    'processing': 'PROCESSANDO',
+    'shipped': 'ENVIADO',
+    'delivered': 'ENTREGUE',
+    'cancelled': 'CANCELADO',
+    'approved': 'APROVADO',
+    'invoiced': 'FATURADO'
+  };
+  return map[jetStatus] || jetStatus || 'DESCONHECIDO';
+}
+
+// ─── BUSCAR PEDIDOS NA API JET ─────────────────────────────────────────────
 async function fetchOrders({ page = 1, pageSize = 50, dateFrom, dateTo, status } = {}) {
   const params = { page, pageSize };
   if (dateFrom) params.startDate = dateFrom;
   if (dateTo)   params.endDate   = dateTo;
   if (status)   params.status    = status;
 
-  // Endpoint da JET para pedidos
-  // Ajuste o path conforme documentação do seu contrato
   const data = await apiGet("/orders", params);
-
-  // A JET pode retornar { orders: [...] } ou { content: [...] } ou array direto
   return data.orders || data.content || data || [];
 }
 
-// Busca pedido individual pelo ID da JET
 async function fetchOrder(jetOrderId) {
   return apiGet(`/orders/${jetOrderId}`);
 }
 
-// Busca pedido pelo ID do marketplace
-async function fetchOrderByMpId(mpOrderId) {
-  const data = await apiGet("/orders", { marketplaceOrderId: mpOrderId });
-  const list = data.orders || data.content || data || [];
-  return list[0] || null;
-}
-
-// ─── MAPEAR STATUS JET → INTERNO ──────────────────────────────────────────────
-function mapStatus(jetStatus) {
-  if (!jetStatus) return "jet";
-  const s = String(jetStatus).toUpperCase();
-  const map = {
-    NEW: "jet",
-    APPROVED: "jet",
-    PROCESSING: "jet",
-    BILLED: "invoiced",
-    INVOICED: "invoiced",
-    SHIPPED: "returned",
-    DELIVERED: "ok",
-    CANCELED: "cancelled",
-    RETURNED: "cancelled",
-  };
-  return map[s] || "jet";
-}
-
-// ─── ENRIQUECER PEDIDO JÁ NO BANCO ───────────────────────────────────────────
-function enrichOrder(jetOrder) {
+// ─── CORRIGIDO: Salvar/atualizar pedido da JET ─────────────────────────────
+async function upsertJetOrder(jetOrder) {
   const now = new Date().toISOString();
-  const jetId     = String(jetOrder.orderId || jetOrder.id || "");
+  
+  // Extrair IDs
+  const jetOrderId = String(jetOrder.orderId || jetOrder.id || "");
   const mpOrderId = String(jetOrder.marketplaceOrderId || jetOrder.externalOrderId || "");
-  const jetStatus = mapStatus(jetOrder.status || jetOrder.situationCode);
-  const erpId     = String(jetOrder.erpOrderId || jetOrder.erpId || "");
-
-  // Localiza o pedido — tenta por mp_order_id, depois jet_order_id
-  let row = mpOrderId
-    ? db.prepare("SELECT * FROM orders WHERE mp_order_id = ?").get(mpOrderId)
-    : null;
-
-  if (!row && jetId) {
-    row = db.prepare("SELECT * FROM orders WHERE jet_order_id = ?").get(jetId);
+  const erpOrderId = String(jetOrder.erpOrderId || jetOrder.erpId || "");
+  
+  // Status mapeado
+  const currentStatus = mapStatus(jetOrder.status || jetOrder.situationCode);
+  
+  // Extrair marketplace
+  const marketplaceOrigem = jetOrder.marketplaceName || jetOrder.channel || "JET";
+  const loja = jetOrder.accountName || jetOrder.storeName || null;
+  
+  // Qual ID usar para buscar? Prioridade: mpOrderId (número do marketplace) > jetOrderId
+  const buscarPor = mpOrderId || jetOrderId;
+  
+  if (!buscarPor) {
+    console.error('[JET] Pedido sem identificador:', jetOrder);
+    return { error: 'Pedido sem identificador' };
   }
 
-  if (row) {
-    const newStatus = advanceStatus(row.status, jetStatus);
-    db.prepare(`
-      UPDATE orders SET
-        jet_order_id = COALESCE(NULLIF(jet_order_id,''), ?),
-        erp_order_id = COALESCE(NULLIF(erp_order_id,''), ?),
-        status       = ?,
-        sla_status   = ?,
-        updated_at   = ?
-      WHERE id = ?
-    `).run(jetId, erpId, newStatus, calcSla(row.created_at), now, row.id);
-
-    logEvent(row.order_id, "jet", "enriched", { jetStatus, erpId });
-    return { action: "updated", orderId: row.order_id };
-  }
-
-  // Não encontrou — insere como pedido JET
-  const internalId = `JET-${jetId || Date.now()}`;
-  db.prepare(`
-    INSERT INTO orders
-      (order_id, marketplace, mp_order_id, jet_order_id, erp_order_id,
-       value, status, sla_status, created_at, updated_at, raw_data)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    internalId,
-    jetOrder.marketplaceName || jetOrder.channel || "Desconhecido",
-    mpOrderId,
-    jetId,
-    erpId,
-    parseFloat(jetOrder.totalAmount || jetOrder.total || 0),
-    jetStatus,
-    "ok",
-    jetOrder.createdAt || jetOrder.orderDate || now,
-    now,
-    JSON.stringify(jetOrder)
+  // Buscar pedido existente
+  const existing = await db.query(
+    `SELECT id, id_jet, id_anymarket, numero_marketplace 
+     FROM pedidos_mapeamento 
+     WHERE numero_marketplace = $1 OR id_jet = $2`,
+    [buscarPor, jetOrderId]
   );
 
-  logEvent(internalId, "jet", "inserted", { jetStatus });
-  return { action: "inserted", orderId: internalId };
+  if (existing.rows.length > 0) {
+    const pedidoExistente = existing.rows[0];
+    const numeroMarketplace = pedidoExistente.numero_marketplace;
+    
+    // Buscar último status da JET para este pedido
+    const lastEvent = await db.query(
+      `SELECT status, timestamp 
+       FROM tracking_events 
+       WHERE pedido_id = $1 AND origem = 'JET'
+       ORDER BY timestamp DESC 
+       LIMIT 1`,
+      [numeroMarketplace]
+    );
+    
+    const lastStatus = lastEvent.rows[0]?.status;
+    const statusChanged = lastStatus !== currentStatus;
+    
+    // Atualizar mapeamento
+    await db.query(`
+      UPDATE pedidos_mapeamento 
+      SET id_jet = $1,
+          id_erp = $2,
+          marketplace_origem = COALESCE($3, marketplace_origem),
+          loja = COALESCE($4, loja),
+          atualizado_em = NOW()
+      WHERE numero_marketplace = $5
+    `, [jetOrderId, erpOrderId, marketplaceOrigem, loja, numeroMarketplace]);
+    
+    // Se status mudou, registrar evento
+    if (statusChanged) {
+      await db.query(`
+        INSERT INTO tracking_events (
+          id, pedido_id, origem, status, timestamp, payload, criado_em, dados_completos
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
+        ON CONFLICT (pedido_id, origem, status) 
+        DO UPDATE SET 
+          timestamp = EXCLUDED.timestamp,
+          payload = EXCLUDED.payload,
+          dados_completos = EXCLUDED.dados_completos
+      `, [
+        uuidv4(),
+        numeroMarketplace,
+        'JET',
+        currentStatus,
+        jetOrder.orderDate || jetOrder.createdAt || now,
+        JSON.stringify({
+          event: 'status_changed',
+          old_status: lastStatus,
+          new_status: currentStatus,
+          jet_order_id: jetOrderId,
+          erp_order_id: erpOrderId
+        }),
+        JSON.stringify(jetOrder)
+      ]);
+      
+      console.log(`[JET] Pedido ${jetOrderId} status alterado: ${lastStatus} → ${currentStatus}`);
+    } else {
+      console.log(`[JET] Pedido ${jetOrderId} atualizado (mesmo status: ${currentStatus})`);
+    }
+    
+    return { action: 'updated', numero_marketplace: numeroMarketplace };
+    
+  } else {
+    // PEDIDO NOVO - Inserir
+    const novoNumeroMarketplace = mpOrderId || jetOrderId;
+    
+    await db.query(`
+      INSERT INTO pedidos_mapeamento (
+        id_jet,
+        id_erp,
+        numero_marketplace,
+        marketplace_origem,
+        loja,
+        criado_em,
+        atualizado_em
+      )
+      VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+    `, [jetOrderId, erpOrderId, novoNumeroMarketplace, marketplaceOrigem, loja]);
+    
+    // Registrar primeiro evento
+    await db.query(`
+      INSERT INTO tracking_events (
+        id, pedido_id, origem, status, timestamp, payload, criado_em, dados_completos
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
+      ON CONFLICT (pedido_id, origem, status) 
+      DO NOTHING
+    `, [
+      uuidv4(),
+      novoNumeroMarketplace,
+      'JET',
+      currentStatus,
+      jetOrder.orderDate || jetOrder.createdAt || now,
+      JSON.stringify({
+        event: 'pedido_criado',
+        jet_order_id: jetOrderId,
+        erp_order_id: erpOrderId
+      }),
+      JSON.stringify(jetOrder)
+    ]);
+    
+    console.log(`[JET] Pedido ${jetOrderId} inserido (status: ${currentStatus})`);
+    return { action: 'inserted', numero_marketplace: novoNumeroMarketplace };
+  }
 }
 
-// ─── PROCESSAR WEBHOOK JET ────────────────────────────────────────────────────
-function processWebhook(payload) {
+// ─── CORRIGIDO: Processar webhook da JET ─────────────────────────────────────
+async function processWebhook(payload) {
   const now = new Date().toISOString();
-
-  const logId = db.prepare(`
+  
+  // Extrair o pedido do payload (diferentes formatos possíveis)
+  const jetOrder = payload.order || payload.data || payload;
+  
+  // Registrar log do webhook
+  const logResult = await db.query(`
     INSERT INTO webhook_log (source, event_type, payload, received_at)
-    VALUES ('jet', ?, ?, ?)
-  `).run(payload.event || payload.type || "unknown", JSON.stringify(payload), now).lastInsertRowid;
-
+    VALUES ('jet', $1, $2, $3)
+    RETURNING id
+  `, [payload.event || payload.type || "unknown", JSON.stringify(payload), now]);
+  
+  const logId = logResult.rows[0].id;
+  
   try {
-    // A JET pode mandar diferentes formatos dependendo do evento
-    const jetOrder = payload.order || payload.data || payload;
-    const result = enrichOrder(jetOrder);
-
-    db.prepare("UPDATE webhook_log SET processed = 1 WHERE id = ?").run(logId);
-    return result;
+    const result = await upsertJetOrder(jetOrder);
+    
+    await db.query(`UPDATE webhook_log SET processed = true WHERE id = $1`, [logId]);
+    
+    console.log(`[Webhook JET] Processado com sucesso:`, result);
+    return { ok: true, ...result };
+    
   } catch (err) {
-    db.prepare("UPDATE webhook_log SET error = ? WHERE id = ?").run(err.message, logId);
+    console.error(`[Webhook JET] Erro:`, err.message);
+    await db.query(`UPDATE webhook_log SET error = $1 WHERE id = $2`, [err.message, logId]);
     throw err;
   }
 }
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
-function logEvent(orderId, step, eventType, payload) {
-  try {
-    db.prepare(`
-      INSERT INTO order_events (order_id, step, event_type, payload, source, occurred_at)
-      VALUES (?, ?, ?, ?, 'jet', ?)
-    `).run(orderId, step, eventType, JSON.stringify(payload), new Date().toISOString());
-  } catch (_) {}
-}
-
-const STATUS_ORDER = ["new", "anymarket", "jet", "erp", "invoiced", "returned", "ok", "cancelled"];
-function advanceStatus(current, incoming) {
-  const ci = STATUS_ORDER.indexOf(current);
-  const ii = STATUS_ORDER.indexOf(incoming);
-  return ii > ci ? incoming : current;
-}
-
-function calcSla(createdAt) {
-  const warnH = parseInt(process.env.SLA_WARNING_HOURS || 36);
-  const critH = parseInt(process.env.SLA_CRITICAL_HOURS || 48);
-  const diffH = (Date.now() - new Date(createdAt).getTime()) / 3600000;
-  if (diffH >= critH) return "critical";
-  if (diffH >= warnH) return "warning";
-  return "ok";
+// ─── FUNÇÃO PARA ENRIQUECER PEDIDOS EXISTENTES ──────────────────────────────
+async function enrichExistingOrders(limit = 100) {
+  // Buscar pedidos que têm id_anymarket mas não têm id_jet
+  const pedidos = await db.query(`
+    SELECT numero_marketplace, id_anymarket
+    FROM pedidos_mapeamento
+    WHERE id_jet IS NULL 
+      AND id_anymarket IS NOT NULL
+    LIMIT $1
+  `, [limit]);
+  
+  let atualizados = 0;
+  
+  for (const pedido of pedidos.rows) {
+    try {
+      // Buscar na API do JET pelo número do marketplace
+      const jetOrders = await fetchOrders({ 
+        marketplaceOrderId: pedido.numero_marketplace 
+      });
+      
+      if (jetOrders && jetOrders.length > 0) {
+        await upsertJetOrder(jetOrders[0]);
+        atualizados++;
+      }
+    } catch (err) {
+      console.error(`[JET Enrich] Erro ao processar ${pedido.numero_marketplace}:`, err.message);
+    }
+  }
+  
+  return { atualizados, total: pedidos.rows.length };
 }
 
 module.exports = {
   fetchOrders,
   fetchOrder,
-  fetchOrderByMpId,
   mapStatus,
-  enrichOrder,
+  upsertJetOrder,
   processWebhook,
+  enrichExistingOrders
 };

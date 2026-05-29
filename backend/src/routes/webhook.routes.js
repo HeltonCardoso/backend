@@ -1,13 +1,6 @@
 /**
  * webhook.routes.js
- * 
- * Recebe webhooks do Anymarket e da JET.
- * 
- * Configure nas plataformas:
- *   Anymarket: POST https://seudominio.com/api/webhooks/anymarket
- *   JET:       POST https://seudominio.com/api/webhooks/jet
  */
-
 const express = require("express");
 const router  = express.Router();
 const anymarketService = require("../services/anymarket.service");

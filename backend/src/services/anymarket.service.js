@@ -183,25 +183,68 @@ async function processWebhook(payload) {
   const now = new Date().toISOString();
 
   try {
-    const orderId = payload.orderId || payload.id;
+    // 🔥 CORREÇÃO: Extrair o pedido do content
+    let orderData = payload;
+    
+    // Se tiver a estrutura { type, event, content }, usa o content
+    if (payload.content && payload.content.id) {
+      orderData = payload.content;
+      console.log(`[Webhook] Extraindo order do content: ${orderData.id}`);
+    }
+    
+    // Se tiver a estrutura { data: { ... } }
+    if (payload.data && payload.data.id) {
+      orderData = payload.data;
+    }
+    
+    const orderId = orderData.id || payload.id;
     if (!orderId) {
-      console.error('[Webhook] Payload sem orderId:', payload);
+      console.error('[Webhook] Payload sem orderId:', JSON.stringify(payload).substring(0, 500));
       return { ok: false, error: 'Webhook sem orderId' };
     }
+
+    // Mapear o evento para status
+    const eventToStatus = {
+      'PAID_WAITING_SHIP': 'PAGO_AGUARDANDO_ENVIO',
+      'PAID_WAITING_DELIVERY': 'PAGO_AGUARDANDO_ENTREGA',
+      'INVOICED': 'FATURADO',
+      'SHIPPED': 'ENVIADO',
+      'DELIVERED': 'ENTREGUE',
+      'CANCELED': 'CANCELADO',
+      'APPROVED': 'APROVADO'
+    };
+    
+    // Pega o status do event ou do orderData.status
+    const statusRaw = orderData.status || payload.event || payload.type;
+    const currentStatus = eventToStatus[statusRaw] || mapStatus(statusRaw);
+    
+    // Prepara os dados do pedido no formato que o upsertOrder espera
+    const orderForUpsert = {
+      id: orderId,
+      marketPlaceId: orderData.marketPlaceId || orderData.marketplaceOrderId || orderData.oi || orderId,
+      marketPlace: orderData.marketPlace || orderData.marketplaceName,
+      status: currentStatus,
+      situationCode: payload.event,
+      createdAt: orderData.createdAt || orderData.created_at || now,
+      accountName: orderData.accountName,
+      total: orderData.total || orderData.totalAmount
+    };
+    
+    console.log(`[Webhook] Processando pedido: ${orderId}, status: ${currentStatus}`);
 
     // Registrar log do webhook
     const logResult = await pool.query(`
       INSERT INTO webhook_log (source, event_type, payload, received_at)
       VALUES ($1, $2, $3, $4)
       RETURNING id
-    `, ['anymarket', payload.type || payload.situationCode || "unknown", JSON.stringify(payload), now]);
+    `, ['anymarket', payload.type || payload.event || "unknown", JSON.stringify(payload), now]);
 
     const logId = logResult.rows[0].id;
 
     // Processar o pedido
-    const result = await upsertOrder(payload);
+    const result = await upsertOrder(orderForUpsert);
 
-    // CORRIGIDO: usar 1 em vez de true
+    // Marcar como processado
     await pool.query(`UPDATE webhook_log SET processed = 1 WHERE id = $1`, [logId]);
     
     console.log(`[Webhook Anymarket] Processado com sucesso: ${orderId}`);

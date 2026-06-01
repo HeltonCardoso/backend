@@ -314,15 +314,14 @@ const DashboardController = {
               THEN EXTRACT(EPOCH FROM (pm.prazo_despacho - NOW())) / 3600
               ELSE NULL
             END AS horas_ate_prazo,
-            a.tipo AS anomalia_tipo,
-            a.descricao AS anomalia_descricao
+            a.tipo AS anomalia_tipo
           FROM tracking_events te
           LEFT JOIN pedidos_mapeamento pm ON te.pedido_id = pm.numero_marketplace
           LEFT JOIN anomalias a ON te.pedido_id = a.pedido_id AND a.resolvida = false
           ${baseWhere}
           GROUP BY te.pedido_id, pm.marketplace_origem, pm.loja,
                    pm.id_anymarket, pm.id_jet, pm.id_onclick, pm.prazo_despacho,
-                   a.tipo, a.descricao
+                   a.tipo
         )
         SELECT *
         FROM eventos_pedido
